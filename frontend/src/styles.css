@@ -1,0 +1,157 @@
+:root {
+  color-scheme: light;
+  font-family: "IBM Plex Sans", "SF Pro Display", "Segoe UI Variable", "PingFang SC", sans-serif;
+  background: #eef3f4;
+  color: #10212b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(15, 123, 143, 0.14), transparent 30%),
+    linear-gradient(180deg, #f7fafb 0%, #eef3f4 100%);
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.app-shell {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 32px;
+}
+
+.hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: flex-start;
+  margin-bottom: 24px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+  color: #52636d;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: 42px;
+  line-height: 1;
+}
+
+.subtitle {
+  max-width: 720px;
+  color: #52636d;
+}
+
+.status-badge {
+  min-width: 160px;
+  padding: 18px;
+  border-radius: 18px;
+  background: #ffffff;
+  border: 1px solid #d7e0e4;
+  display: grid;
+  gap: 6px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.panel {
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #d7e0e4;
+  border-radius: 20px;
+  padding: 20px;
+  box-shadow: 0 12px 40px rgba(16, 33, 43, 0.06);
+}
+
+.panel-wide {
+  grid-column: 1 / -1;
+}
+
+.panel h2,
+.panel h3 {
+  margin-top: 0;
+}
+
+label {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+  color: #33444e;
+}
+
+input,
+textarea {
+  width: 100%;
+  border-radius: 14px;
+  border: 1px solid #cbd6db;
+  background: #fff;
+  padding: 12px 14px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 12px 0 16px;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 18px;
+  background: #10212b;
+  color: #fff;
+  cursor: pointer;
+}
+
+button:hover {
+  opacity: 0.92;
+}
+
+.json-block {
+  margin: 0;
+  padding: 16px;
+  border-radius: 16px;
+  background: #0f1720;
+  color: #d9e7ee;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: auto;
+}
+
+.message {
+  color: #0f7b8f;
+  font-weight: 600;
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    padding: 20px;
+  }
+
+  .hero {
+    flex-direction: column;
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
