@@ -56,6 +56,28 @@ type LocalRuleSummary = {
   cidr: number;
 };
 
+type RawLogEntry = Partial<LogEntry> & {
+  Timestamp?: string;
+  Level?: string;
+  Module?: string;
+  Message?: string;
+  Fields?: Record<string, unknown>;
+};
+
+type RawUpstreamHealth = Partial<UpstreamHealth> & {
+  Reachable?: boolean;
+  Protocol?: string;
+  RTTMs?: number;
+  LastSuccessAt?: string;
+  ConsecutiveFailures?: number;
+};
+
+type RawHealthStatus = Partial<HealthStatus> & {
+  CheckedAt?: string;
+  Company?: RawUpstreamHealth;
+  Personal?: RawUpstreamHealth;
+};
+
 type IconName =
   | "activity"
   | "chevronDown"
@@ -135,6 +157,8 @@ function formatTimestamp(value?: string) {
 
 function formatProtocol(value?: string) {
   switch ((value ?? "").toLowerCase()) {
+    case "direct":
+      return "DIRECT";
     case "http":
       return "HTTP";
     case "socks5":
@@ -290,6 +314,113 @@ function firstBlockingCheck(report: PreflightReport | null) {
 
 function formatPreflightMode(value?: string) {
   return value === "tun" ? "TUN 共存模式" : "系统代理模式";
+}
+
+function pickString(...values: unknown[]) {
+  for (const value of values) {
+    if (typeof value === "string") {
+      return value;
+    }
+  }
+  return "";
+}
+
+function pickBoolean(...values: unknown[]) {
+  for (const value of values) {
+    if (typeof value === "boolean") {
+      return value;
+    }
+  }
+  return false;
+}
+
+function pickNumber(...values: unknown[]) {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return 0;
+}
+
+function pickRecord(...values: unknown[]) {
+  for (const value of values) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+function normalizeLogEntry(entry: unknown): LogEntry | null {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+
+  const raw = entry as RawLogEntry;
+  const timestamp = pickString(raw.timestamp, raw.Timestamp).trim();
+  const level = pickString(raw.level, raw.Level).trim().toUpperCase() || "INFO";
+  const module = pickString(raw.module, raw.Module).trim() || "app";
+  const message = pickString(raw.message, raw.Message).trim();
+  const fields = pickRecord(raw.fields, raw.Fields);
+
+  if (!timestamp && !message && !fields && !pickString(raw.level, raw.Level, raw.module, raw.Module)) {
+    return null;
+  }
+
+  return {
+    timestamp,
+    level,
+    module,
+    message,
+    fields,
+  };
+}
+
+function normalizeLogEntries(entries: unknown): LogEntry[] {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  return entries
+    .map((entry) => normalizeLogEntry(entry))
+    .filter((entry): entry is LogEntry => entry !== null);
+}
+
+function normalizeUpstreamHealth(value: unknown): UpstreamHealth {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      reachable: false,
+      protocol: "unknown",
+      rttMs: 0,
+      consecutiveFailures: 0,
+    };
+  }
+
+  const raw = value as RawUpstreamHealth;
+  const lastSuccessAt = pickString(raw.lastSuccessAt, raw.LastSuccessAt).trim();
+
+  return {
+    reachable: pickBoolean(raw.reachable, raw.Reachable),
+    protocol: pickString(raw.protocol, raw.Protocol).trim() || "unknown",
+    rttMs: pickNumber(raw.rttMs, raw.RTTMs),
+    lastSuccessAt: lastSuccessAt || undefined,
+    consecutiveFailures: pickNumber(raw.consecutiveFailures, raw.ConsecutiveFailures),
+  };
+}
+
+function normalizeHealthStatus(value: unknown): HealthStatus | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const raw = value as RawHealthStatus;
+  const checkedAt = pickString(raw.checkedAt, raw.CheckedAt).trim();
+
+  return {
+    checkedAt: checkedAt || undefined,
+    company: normalizeUpstreamHealth(raw.company ?? raw.Company),
+    personal: normalizeUpstreamHealth(raw.personal ?? raw.Personal),
+  };
 }
 
 function Icon({ name, className }: { name: IconName; className?: string }) {
@@ -488,13 +619,23 @@ export function App() {
   const logSectionRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    const applyHealthStatus = (payload: unknown) => {
+      setHealth(normalizeHealthStatus(payload));
+    };
+
+    const appendLogEntry = (entry: unknown) => {
+      const normalized = normalizeLogEntry(entry);
+      if (!normalized) {
+        return;
+      }
+      setLogs((current) => [...current, normalized].slice(-50));
+    };
+
     const disposers = [
       runtimeEvents.onRuntimeStatus(setRuntimeStatus),
-      runtimeEvents.onRuntimeHealth(setHealth),
+      runtimeEvents.onRuntimeHealth(applyHealthStatus),
       runtimeEvents.onRuntimeTraffic(setTraffic),
-      runtimeEvents.onRuntimeLog((entry) =>
-        setLogs((current) => [...current, entry].slice(-50)),
-      ),
+      runtimeEvents.onRuntimeLog(appendLogEntry),
       runtimeEvents.onRuntimeError((payload) => {
         setNotice({
           tone: "error",
@@ -524,9 +665,9 @@ export function App() {
       setConfig(loadedConfig);
       setSavedConfigKey(serializeConfig(loadedConfig));
       setRuntimeStatus(nextRuntimeStatus);
-      setHealth(nextHealth);
+      setHealth(normalizeHealthStatus(nextHealth));
       setTraffic(nextTraffic);
-      setLogs(nextLogs);
+      setLogs(normalizeLogEntries(nextLogs));
       setPreflight(nextPreflight);
       setNotice({ tone: "success", text: "配置与运行状态已同步" });
     } catch (error) {
@@ -659,7 +800,7 @@ export function App() {
     const payload = logs
       .map((entry) => {
         const details = entry.fields ? ` ${JSON.stringify(entry.fields)}` : "";
-        return `${formatTimestamp(entry.timestamp)} [${entry.level}] ${entry.module} ${entry.message}${details}`;
+        return `${formatTimestamp(entry.timestamp)} [${entry.level || "INFO"}] ${entry.module || "app"} ${entry.message}${details}`;
       })
       .join("\n");
 
@@ -849,7 +990,9 @@ export function App() {
                       onChange={(event) => updateCompanyPort(event.target.value)}
                       disabled={isBusy}
                     />
-                    <span className="protocol-pill">{formatProtocol(health?.company.protocol || config.companyUpstream.protocol)}</span>
+                    <span className="protocol-pill">
+                      {formatProtocol(health?.company?.protocol || config.companyUpstream.protocol)}
+                    </span>
                   </div>
                   <p className="field-hint">
                     {healthHint(health?.company, config.companyUpstream.protocol)}
@@ -874,7 +1017,7 @@ export function App() {
                       disabled={isBusy}
                     />
                     <span className="protocol-pill protocol-pill--personal">
-                      {formatProtocol(health?.personal.protocol || config.personalUpstream.protocol)}
+                      {formatProtocol(health?.personal?.protocol || config.personalUpstream.protocol)}
                     </span>
                   </div>
                   <p className="field-hint">
@@ -1023,10 +1166,13 @@ export function App() {
                 {recentLogs.length ? (
                   <div className="log-list">
                     {recentLogs.map((entry, index) => (
-                      <div className={`log-item log-item--${entry.level.toLowerCase()}`} key={`${entry.timestamp}-${index}`}>
+                      <div
+                        className={`log-item log-item--${(entry.level || "INFO").toLowerCase()}`}
+                        key={`${entry.timestamp || entry.message}-${index}`}
+                      >
                         <span className="log-item__time">{formatTimestamp(entry.timestamp)}</span>
                         <div className="log-item__body">
-                          <strong>{entry.module}</strong>
+                          <strong>{entry.module || "app"}</strong>
                           <span>{entry.message}</span>
                         </div>
                       </div>

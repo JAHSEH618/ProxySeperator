@@ -1,5 +1,3 @@
-import { Events } from "@wailsio/runtime";
-
 import type {
   Config,
   HealthStatus,
@@ -11,25 +9,53 @@ import type {
   TrafficStats,
 } from "../types/backend";
 
+type WailsEvent<T = unknown> = {
+  name: string;
+  data: T;
+  sender?: unknown;
+};
+
 declare global {
   interface Window {
     wails?: {
-      Call: (method: string, ...args: unknown[]) => Promise<unknown>;
+      Call?: {
+        ByName: (methodName: string, ...args: unknown[]) => Promise<unknown>;
+      };
+      Events?: {
+        On: (eventName: string, handler: (event: WailsEvent) => void) => () => void;
+      };
     };
   }
 }
 
-const SERVICE = "BackendAPI";
+type LoadedRuntime = {
+  Call: {
+    ByName: (methodName: string, ...args: unknown[]) => Promise<unknown>;
+  };
+  Events: {
+    On: (eventName: string, handler: (event: WailsEvent) => void) => () => void;
+  };
+};
 
-function ensureRuntime() {
-  if (!window.wails?.Call) {
-    throw new Error("Wails runtime 未初始化");
+const SERVICE = "github.com/friedhelmliu/ProxySeperator/internal/app.BackendAPI";
+
+function unwrapEventData<T>(payload: WailsEvent<T> | T): T {
+  if (payload && typeof payload === "object" && "data" in payload) {
+    return (payload as WailsEvent<T>).data;
   }
+  return payload as T;
+}
+
+function getRuntime(): LoadedRuntime {
+  const runtime = window.wails;
+  if (!runtime?.Call?.ByName || !runtime.Events?.On) {
+    throw new Error("Wails runtime 未加载");
+  }
+  return runtime as LoadedRuntime;
 }
 
 async function call<T>(method: string, ...args: unknown[]): Promise<T> {
-  ensureRuntime();
-  return (await window.wails!.Call(`${SERVICE}.${method}`, ...args)) as T;
+  return (await getRuntime().Call.ByName(`${SERVICE}.${method}`, ...args)) as T;
 }
 
 export const backend = {
@@ -51,13 +77,13 @@ export const backend = {
 
 export const runtimeEvents = {
   onRuntimeStatus: (handler: (payload: RuntimeStatus) => void) =>
-    Events.On("runtime:status", (event) => handler(event.data as RuntimeStatus)),
+    getRuntime().Events.On("runtime:status", (event) => handler(unwrapEventData(event) as RuntimeStatus)),
   onRuntimeHealth: (handler: (payload: HealthStatus) => void) =>
-    Events.On("runtime:health", (event) => handler(event.data as HealthStatus)),
+    getRuntime().Events.On("runtime:health", (event) => handler(unwrapEventData(event) as HealthStatus)),
   onRuntimeTraffic: (handler: (payload: TrafficStats) => void) =>
-    Events.On("runtime:traffic", (event) => handler(event.data as TrafficStats)),
+    getRuntime().Events.On("runtime:traffic", (event) => handler(unwrapEventData(event) as TrafficStats)),
   onRuntimeError: (handler: (payload: unknown) => void) =>
-    Events.On("runtime:error", (event) => handler(event.data)),
+    getRuntime().Events.On("runtime:error", (event) => handler(unwrapEventData(event))),
   onRuntimeLog: (handler: (payload: LogEntry) => void) =>
-    Events.On("runtime:log", (event) => handler(event.data as LogEntry)),
+    getRuntime().Events.On("runtime:log", (event) => handler(unwrapEventData(event) as LogEntry)),
 };

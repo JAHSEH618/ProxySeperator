@@ -21,6 +21,14 @@ func ProbeUpstream(ctx context.Context, cfg api.UpstreamConfig) api.UpstreamHeal
 	start := time.Now()
 	health := api.UpstreamHealth{Protocol: api.ProtocolUnknown}
 
+	if cfg.Protocol == api.ProtocolDirect {
+		health.Reachable = true
+		health.Protocol = api.ProtocolDirect
+		health.LastSuccessAt = time.Now()
+		health.RTTMs = time.Since(start).Milliseconds()
+		return health
+	}
+
 	conn, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", cfg.Address())
 	if err != nil {
 		health.ConsecutiveFailures++

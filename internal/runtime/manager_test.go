@@ -145,6 +145,90 @@ func TestRunPreflightAutoSwitchesToTUNOnSystemProxyConflict(t *testing.T) {
 	}
 }
 
+func TestRunPreflightReusesExistingTunnelWhenSystemProxyMatchesPersonalUpstream(t *testing.T) {
+	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+		defaultEgress: "utun8",
+	}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:17900",
+		SOCKSListenAddr:     "127.0.0.1:17901",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.CompanyUpstream = api.UpstreamConfig{Host: "127.0.0.1", Port: 7890, Protocol: api.ProtocolAuto}
+	cfg.PersonalUpstream = personalUpstream
+
+	report, err := manager.RunPreflight(cfg)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	if !report.CanStart {
+		t.Fatalf("expected preflight can start, got %+v", report)
+	}
+	if report.EffectiveMode != api.ModeSystem {
+		t.Fatalf("expected system mode, got %+v", report)
+	}
+	if got := manager.health.Company.Protocol; got != api.ProtocolDirect {
+		t.Fatalf("expected company protocol direct, got %q", got)
+	}
+}
+
+func TestStartUsesResolvedDirectCompanyTransportWhenTunnelDetected(t *testing.T) {
+	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+		defaultEgress: "utun8",
+	}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.CompanyUpstream = api.UpstreamConfig{Host: "127.0.0.1", Port: 7890, Protocol: api.ProtocolAuto}
+	cfg.PersonalUpstream = personalUpstream
+
+	status, err := manager.Start(cfg)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	if status.Mode != api.ModeSystem {
+		t.Fatalf("expected system mode, got %+v", status)
+	}
+	if got := manager.forwarder.companyConfig.Protocol; got != api.ProtocolDirect {
+		t.Fatalf("expected direct company transport, got %q", got)
+	}
+	if !controller.applied {
+		t.Fatal("expected system proxy to be applied")
+	}
+}
+
 func TestRunPreflightBlocksWhenSystemProxyConflictAndTUNUnavailable(t *testing.T) {
 	companyStub := startSOCKS5Stub(t)
 	personalStub := startSOCKS5Stub(t)
@@ -210,6 +294,44 @@ func TestRunPreflightBlocksWhenRecoveryJournalExists(t *testing.T) {
 	}
 	if !report.RecoveryRequired || report.CanStart {
 		t.Fatalf("expected recovery to block start, got %+v", report)
+	}
+}
+
+func TestRunPreflightDoesNotBlockOnRecoveryJournalWhileRuntimeIsActive(t *testing.T) {
+	companyStub := startSOCKS5Stub(t)
+	personalStub := startSOCKS5Stub(t)
+	journalPath := t.TempDir() + "/recovery.json"
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: journalPath,
+	})
+
+	if err := manager.journal.Save(api.RecoverySnapshot{Platform: "test", Mode: api.ModeSystem, WrittenAt: time.Now()}); err != nil {
+		t.Fatalf("save journal: %v", err)
+	}
+	manager.status.State = api.RuntimeStateRunning
+
+	cfg := api.DefaultConfig()
+	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
+	cfg.PersonalUpstream = upstreamFromAddress(t, personalStub)
+
+	report, err := manager.RunPreflight(cfg)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	if report.RecoveryRequired {
+		t.Fatalf("expected no recovery requirement while runtime active, got %+v", report)
+	}
+	for _, check := range report.Checks {
+		if check.ID == checkNetworkRecovery && check.Status == "fail" {
+			t.Fatalf("expected recovery check not to fail, got %+v", report)
+		}
 	}
 }
 

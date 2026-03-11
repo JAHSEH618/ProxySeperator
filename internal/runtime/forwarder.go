@@ -140,6 +140,8 @@ func (f *Forwarder) dialViaUpstream(ctx context.Context, cfg api.UpstreamConfig,
 		protocol = status.Protocol
 	}
 	switch protocol {
+	case api.ProtocolDirect:
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", target)
 	case api.ProtocolSOCKS5:
 		return dialSOCKS5(ctx, cfg.Address(), target)
 	case api.ProtocolHTTP:

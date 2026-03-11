@@ -106,7 +106,10 @@ func (m *Manager) RunPreflight(cfg api.Config) (api.PreflightReport, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	report := m.runPreflight(ctx, cfg)
+	state := m.evaluatePreflight(ctx, cfg)
+	m.cfg = state.resolvedConfig
+	m.health = state.health
+	report := state.report
 	m.applyPreflightToStatus(report)
 	m.emitHealth()
 	m.emitStatus()
@@ -176,7 +179,10 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	report := m.runPreflight(ctx, cfg)
+	state := m.evaluatePreflight(ctx, cfg)
+	m.cfg = state.resolvedConfig
+	m.health = state.health
+	report := state.report
 	m.applyPreflightToStatus(report)
 	m.emitHealth()
 	m.emitStatus()
@@ -216,8 +222,8 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	}
 	m.emitStatus()
 
-	matcher := rules.NewMatcher(rules.ParseLines(cfg.Rules).Compiled)
-	m.forwarder = NewForwarder(cfg, matcher, m.dnsCache, m.stats, m.logger)
+	matcher := rules.NewMatcher(rules.ParseLines(m.cfg.Rules).Compiled)
+	m.forwarder = NewForwarder(m.cfg, matcher, m.dnsCache, m.stats, m.logger)
 	m.httpProxy = proxy.NewHTTPServer(m.httpListenAddr, m.forwarder, m.logger)
 	m.socks5 = proxy.NewSOCKS5Server(m.socksListenAddr, m.forwarder, m.logger)
 
@@ -297,7 +303,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		}
 	}
 
-	if cfg.Advanced.AutoStart {
+	if m.cfg.Advanced.AutoStart {
 		if exe, err := os.Executable(); err == nil {
 			_ = m.platform.EnableAutoStart(runCtx, exe)
 		}

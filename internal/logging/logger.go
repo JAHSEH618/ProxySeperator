@@ -1,6 +1,9 @@
 package logging
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -14,6 +17,8 @@ type Logger struct {
 	sinks  []Sink
 	mu     sync.RWMutex
 }
+
+var stdoutMu sync.Mutex
 
 func NewLogger(buffer *RingBuffer) *Logger {
 	if buffer == nil {
@@ -67,4 +72,27 @@ func (l *Logger) Error(module, message string, fields map[string]any) api.LogEnt
 
 func (l *Logger) List(limit int) []api.LogEntry {
 	return l.buffer.List(limit)
+}
+
+func StdoutSink(entry api.LogEntry) {
+	fields := ""
+	if len(entry.Fields) > 0 {
+		if payload, err := json.Marshal(entry.Fields); err == nil {
+			fields = " " + string(payload)
+		} else {
+			fields = fmt.Sprintf(" %v", entry.Fields)
+		}
+	}
+
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
+	fmt.Fprintf(
+		os.Stdout,
+		"%s [%s] %s %s%s\n",
+		entry.Timestamp.Format(time.RFC3339),
+		entry.Level,
+		entry.Module,
+		entry.Message,
+		fields,
+	)
 }

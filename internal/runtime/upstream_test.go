@@ -36,6 +36,15 @@ func TestProbeUpstreamDetectsHTTPProxy(t *testing.T) {
 	}
 }
 
+func TestProbeUpstreamTreatsDirectTransportAsReachable(t *testing.T) {
+	health := ProbeUpstream(context.Background(), api.UpstreamConfig{
+		Protocol: api.ProtocolDirect,
+	})
+	if !health.Reachable || health.Protocol != api.ProtocolDirect {
+		t.Fatalf("unexpected health: %+v", health)
+	}
+}
+
 func startSOCKS5Stub(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

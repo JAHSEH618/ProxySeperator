@@ -24,6 +24,7 @@ const (
 
 const (
 	ProtocolAuto    = "auto"
+	ProtocolDirect  = "direct"
 	ProtocolHTTP    = "http"
 	ProtocolSOCKS5  = "socks5"
 	ProtocolUnknown = "unknown"

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,11 +149,61 @@ func (c *darwinController) DisableAutoStart(context.Context) error {
 }
 
 func (c *darwinController) CurrentSystemProxy(ctx context.Context) (api.SystemProxyState, error) {
+	if state, ok, err := c.currentEffectiveSystemProxy(ctx); err == nil && ok {
+		return state, nil
+	}
 	states, err := c.captureSystemProxySnapshot(ctx)
 	if err != nil {
 		return api.SystemProxyState{}, err
 	}
 	return summarizeDarwinProxyState(states), nil
+}
+
+func (c *darwinController) currentEffectiveSystemProxy(ctx context.Context) (api.SystemProxyState, bool, error) {
+	output, err := exec.CommandContext(ctx, "scutil", "--proxy").CombinedOutput()
+	if err != nil {
+		return api.SystemProxyState{}, false, fmt.Errorf("read scutil proxy: %w", err)
+	}
+
+	fields := map[string]string{}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "<dictionary> {" || line == "}" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+
+	state := api.SystemProxyState{}
+	if fields["HTTPEnable"] == "1" {
+		state.Enabled = true
+		state.HTTPAddress = joinProxyAddress(fields["HTTPProxy"], fields["HTTPPort"])
+	}
+	if fields["HTTPSEnable"] == "1" {
+		state.Enabled = true
+		state.HTTPSAddress = joinProxyAddress(fields["HTTPSProxy"], fields["HTTPSPort"])
+	}
+	if fields["SOCKSEnable"] == "1" {
+		state.Enabled = true
+		state.SOCKSAddress = joinProxyAddress(fields["SOCKSProxy"], fields["SOCKSPort"])
+	}
+	if !state.Enabled {
+		return api.SystemProxyState{}, false, nil
+	}
+	return state, true, nil
+}
+
+func joinProxyAddress(host, port string) string {
+	host = strings.TrimSpace(host)
+	port = strings.TrimSpace(port)
+	if host == "" || port == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func (c *darwinController) CurrentDNSResolvers(ctx context.Context) ([]string, error) {

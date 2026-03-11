@@ -44,6 +44,7 @@ type BackendAPI struct {
 func NewBackendAPI() *BackendAPI {
 	buffer := logging.NewRingBuffer(500)
 	logger := logging.NewLogger(buffer)
+	logger.AddSink(logging.StdoutSink)
 	emitter := &dynamicEmitter{}
 	store := config.NewStore(api.AppName)
 	journalPath, _ := store.RecoveryJournalPath()
@@ -61,6 +62,9 @@ func NewBackendAPI() *BackendAPI {
 	logger.AddSink(func(entry api.LogEntry) {
 		emitter.Emit(api.EventRuntimeLog, entry)
 	})
+	logger.Info("app", "后端 API 已初始化", map[string]any{
+		"recoveryJournalPath": journalPath,
+	})
 	return apiService
 }
 
@@ -71,57 +75,107 @@ func (b *BackendAPI) BindEvents(fn func(string, any)) {
 func (b *BackendAPI) LoadConfig(context.Context) (api.Config, error) {
 	cfg, err := b.store.Load()
 	if err != nil {
+		b.logger.Error("config", "加载配置失败", map[string]any{"error": err.Error()})
 		return api.Config{}, err
 	}
 	b.mu.Lock()
 	b.cfg = cfg
 	b.mu.Unlock()
+	b.logger.Info("config", "配置已加载", map[string]any{
+		"rules":         len(cfg.Rules),
+		"requestedMode": configuredMode(cfg),
+	})
 	return cfg, nil
 }
 
 func (b *BackendAPI) RunPreflight(context.Context) (api.PreflightReport, error) {
 	cfg, err := b.ensureConfig()
 	if err != nil {
+		b.logger.Error("runtime", "执行启动前检查失败", map[string]any{"error": err.Error()})
 		return api.PreflightReport{}, err
 	}
-	return b.manager.RunPreflight(cfg)
+	report, err := b.manager.RunPreflight(cfg)
+	if err != nil {
+		b.logger.Error("runtime", "启动前检查执行失败", map[string]any{"error": err.Error()})
+		return api.PreflightReport{}, err
+	}
+	b.logger.Info("runtime", "启动前检查完成", map[string]any{
+		"canStart":      report.CanStart,
+		"requestedMode": report.RequestedMode,
+		"effectiveMode": report.EffectiveMode,
+	})
+	return report, nil
 }
 
 func (b *BackendAPI) RecoverNetwork(context.Context) error {
-	return b.manager.RecoverNetwork()
+	b.logger.Info("runtime", "收到恢复网络请求", nil)
+	if err := b.manager.RecoverNetwork(); err != nil {
+		b.logger.Error("runtime", "恢复网络失败", map[string]any{"error": err.Error()})
+		return err
+	}
+	b.logger.Info("runtime", "系统网络状态已恢复", nil)
+	return nil
 }
 
 func (b *BackendAPI) SaveConfig(_ context.Context, cfg api.Config) error {
 	if err := validateConfig(cfg); err != nil {
+		b.logger.Warn("config", "配置校验失败", map[string]any{"error": err.Error()})
 		return err
 	}
 	if err := b.store.Save(cfg); err != nil {
+		b.logger.Error("config", "保存配置失败", map[string]any{"error": err.Error()})
 		return err
 	}
 	b.mu.Lock()
 	b.cfg = cfg
 	b.mu.Unlock()
+	b.logger.Info("config", "配置已保存", map[string]any{
+		"rules":         len(cfg.Rules),
+		"requestedMode": configuredMode(cfg),
+	})
 	return nil
 }
 
 func (b *BackendAPI) Start(ctx context.Context) (api.RuntimeStatus, error) {
 	cfg, err := b.ensureConfig()
 	if err != nil {
+		b.logger.Error("runtime", "启动失败，读取配置出错", map[string]any{"error": err.Error()})
 		return api.RuntimeStatus{}, err
 	}
-	return b.manager.Start(cfg)
+	b.logger.Info("runtime", "收到启动请求", map[string]any{"requestedMode": configuredMode(cfg)})
+	status, err := b.manager.Start(cfg)
+	if err != nil {
+		b.logger.Error("runtime", "启动失败", map[string]any{"error": err.Error()})
+		return api.RuntimeStatus{}, err
+	}
+	b.logger.Info("runtime", "启动成功", map[string]any{"mode": status.Mode})
+	return status, nil
 }
 
 func (b *BackendAPI) Stop(context.Context) error {
-	return b.manager.Stop()
+	b.logger.Info("runtime", "收到停止请求", nil)
+	if err := b.manager.Stop(); err != nil {
+		b.logger.Error("runtime", "停止失败", map[string]any{"error": err.Error()})
+		return err
+	}
+	b.logger.Info("runtime", "停止完成", nil)
+	return nil
 }
 
 func (b *BackendAPI) Restart(ctx context.Context) (api.RuntimeStatus, error) {
 	cfg, err := b.ensureConfig()
 	if err != nil {
+		b.logger.Error("runtime", "重启失败，读取配置出错", map[string]any{"error": err.Error()})
 		return api.RuntimeStatus{}, err
 	}
-	return b.manager.Restart(cfg)
+	b.logger.Info("runtime", "收到重启请求", map[string]any{"requestedMode": configuredMode(cfg)})
+	status, err := b.manager.Restart(cfg)
+	if err != nil {
+		b.logger.Error("runtime", "重启失败", map[string]any{"error": err.Error()})
+		return api.RuntimeStatus{}, err
+	}
+	b.logger.Info("runtime", "重启成功", map[string]any{"mode": status.Mode})
+	return status, nil
 }
 
 func (b *BackendAPI) GetRuntimeStatus(context.Context) (api.RuntimeStatus, error) {
@@ -139,19 +193,27 @@ func (b *BackendAPI) GetTrafficStats(context.Context) (api.TrafficStats, error) 
 func (b *BackendAPI) TestRoute(_ context.Context, input string) (api.RouteTestResult, error) {
 	cfg, err := b.ensureConfig()
 	if err != nil {
+		b.logger.Error("route", "执行路由测试失败，读取配置出错", map[string]any{"error": err.Error()})
 		return api.RouteTestResult{}, err
 	}
 	parseResult := rules.ParseLines(cfg.Rules)
 	matcher := rules.NewMatcher(parseResult.Compiled)
 	result := matcher.Match(input)
-	return api.RouteTestResult{
+	output := api.RouteTestResult{
 		Input:       input,
 		Normalized:  result.Normalized,
 		Target:      result.Target,
 		RuleType:    result.RuleType,
 		MatchedRule: result.MatchedRule,
 		Reason:      result.Reason,
-	}, nil
+	}
+	b.logger.Info("route", "路由测试完成", map[string]any{
+		"input":       input,
+		"target":      output.Target,
+		"ruleType":    output.RuleType,
+		"matchedRule": output.MatchedRule,
+	})
+	return output, nil
 }
 
 func (b *BackendAPI) ValidateRules(_ context.Context, lines []string) (api.RuleValidationResult, error) {
@@ -164,7 +226,7 @@ func (b *BackendAPI) ValidateRules(_ context.Context, lines []string) (api.RuleV
 			Reason: item.Reason,
 		})
 	}
-	return api.RuleValidationResult{
+	result := api.RuleValidationResult{
 		ValidRules:   parseResult.Valid,
 		InvalidRules: invalid,
 		Summary: api.RuleSummary{
@@ -176,7 +238,13 @@ func (b *BackendAPI) ValidateRules(_ context.Context, lines []string) (api.RuleV
 			DomainKeyword: parseResult.Summary.DomainKeyword,
 			CIDR:          parseResult.Summary.CIDR,
 		},
-	}, nil
+	}
+	b.logger.Info("rules", "规则校验完成", map[string]any{
+		"total":   result.Summary.Total,
+		"valid":   result.Summary.Valid,
+		"invalid": result.Summary.Invalid,
+	})
+	return result, nil
 }
 
 func (b *BackendAPI) ListLogs(_ context.Context, limit int) ([]api.LogEntry, error) {
@@ -186,6 +254,7 @@ func (b *BackendAPI) ListLogs(_ context.Context, limit int) ([]api.LogEntry, err
 func (b *BackendAPI) SetLanguage(_ context.Context, lang string) error {
 	cfg, err := b.ensureConfig()
 	if err != nil {
+		b.logger.Error("config", "切换语言失败，读取配置出错", map[string]any{"error": err.Error()})
 		return err
 	}
 	cfg.UI.Language = strings.TrimSpace(lang)
@@ -193,11 +262,13 @@ func (b *BackendAPI) SetLanguage(_ context.Context, lang string) error {
 		cfg.UI.Language = api.DefaultConfig().UI.Language
 	}
 	if err := b.store.Save(cfg); err != nil {
+		b.logger.Error("config", "保存语言设置失败", map[string]any{"error": err.Error()})
 		return err
 	}
 	b.mu.Lock()
 	b.cfg = cfg
 	b.mu.Unlock()
+	b.logger.Info("config", "语言设置已更新", map[string]any{"language": cfg.UI.Language})
 	return nil
 }
 
@@ -236,4 +307,11 @@ func validateConfig(cfg api.Config) error {
 		return api.NewError(api.ErrCodeRuleValidationFailed, "存在无效规则")
 	}
 	return nil
+}
+
+func configuredMode(cfg api.Config) string {
+	if cfg.Advanced.TUNEnabled || cfg.Advanced.Mode == api.ModeTUN {
+		return api.ModeTUN
+	}
+	return api.ModeSystem
 }
