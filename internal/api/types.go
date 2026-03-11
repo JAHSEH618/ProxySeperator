@@ -90,9 +90,9 @@ func DefaultConfig() Config {
 	return Config{
 		Version: 1,
 		CompanyUpstream: UpstreamConfig{
-			Host:     "127.0.0.1",
-			Port:     7890,
-			Protocol: ProtocolAuto,
+			Host:     "system-route",
+			Port:     0,
+			Protocol: ProtocolDirect,
 		},
 		PersonalUpstream: UpstreamConfig{
 			Host:     "127.0.0.1",
@@ -184,6 +184,8 @@ type PreflightReport struct {
 	ModeReason       string           `json:"modeReason"`
 	CanStart         bool             `json:"canStart"`
 	RecoveryRequired bool             `json:"recoveryRequired"`
+	AutoRecovered    bool             `json:"autoRecovered,omitempty"`
+	RecoveryMessage  string           `json:"recoveryMessage,omitempty"`
 	Checks           []PreflightCheck `json:"checks"`
 }
 

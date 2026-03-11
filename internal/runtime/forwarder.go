@@ -25,7 +25,6 @@ type Forwarder struct {
 
 	mu             sync.RWMutex
 	matcher        *rules.Matcher
-	companyConfig  api.UpstreamConfig
 	personalConfig api.UpstreamConfig
 	health         api.HealthStatus
 }
@@ -36,13 +35,12 @@ func NewForwarder(cfg api.Config, matcher *rules.Matcher, dnsCache *localdns.Cac
 		stats:          stats,
 		dnsCache:       dnsCache,
 		matcher:        matcher,
-		companyConfig:  cfg.CompanyUpstream,
 		personalConfig: cfg.PersonalUpstream,
 	}
 }
 
 func (f *Forwarder) RefreshHealth(ctx context.Context) api.HealthStatus {
-	company := ProbeUpstream(ctx, f.companyConfig)
+	company := systemRouteHealth()
 	personal := ProbeUpstream(ctx, f.personalConfig)
 	status := api.HealthStatus{
 		CheckedAt: time.Now(),
@@ -81,7 +79,7 @@ func (f *Forwarder) DialTarget(ctx context.Context, network, addr string) (net.C
 	var err error
 	switch target {
 	case api.RouteTargetCompany:
-		conn, err = f.dialViaUpstream(ctx, f.companyConfig, addr)
+		conn, err = dialSystemRoute(ctx, network, addr)
 	case api.RouteTargetDirect:
 		conn, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
 	default:

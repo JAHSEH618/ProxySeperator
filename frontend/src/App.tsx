@@ -27,7 +27,7 @@ const sampleRules = [
 
 const defaultConfig: Config = {
   version: 1,
-  companyUpstream: { host: "127.0.0.1", port: 7890, protocol: "auto" },
+  companyUpstream: { host: "system-route", port: 0, protocol: "direct" },
   personalUpstream: { host: "127.0.0.1", port: 7897, protocol: "auto" },
   rules: [".company.com", ".internal", "10.0.0.0/8"],
   advanced: {
@@ -198,7 +198,7 @@ function formatRuntimeState(value: string) {
 function formatRouteTarget(value?: string) {
   switch (value) {
     case "company":
-      return "公司代理";
+      return "公司网络";
     case "direct":
       return "直连";
     default:
@@ -271,6 +271,10 @@ function summarizeRules(lines: string[]): LocalRuleSummary {
 }
 
 function healthHint(health: UpstreamHealth | undefined, fallbackProtocol: string) {
+  const protocol = (health?.protocol || fallbackProtocol || "").toLowerCase();
+  if (protocol === "direct") {
+    return "复用系统路由 / 公司 VPN";
+  }
   if (!health) {
     return `等待探测 · ${formatProtocol(fallbackProtocol)}`;
   }
@@ -669,7 +673,12 @@ export function App() {
       setTraffic(nextTraffic);
       setLogs(normalizeLogEntries(nextLogs));
       setPreflight(nextPreflight);
-      setNotice({ tone: "success", text: "配置与运行状态已同步" });
+      setNotice({
+        tone: "success",
+        text: nextPreflight.autoRecovered
+          ? nextPreflight.recoveryMessage || "已自动恢复上次退出遗留的网络配置"
+          : "配置与运行状态已同步",
+      });
     } catch (error) {
       setNotice(noticeFromError(error));
     } finally {
@@ -846,16 +855,6 @@ export function App() {
     }
   }
 
-  function updateCompanyPort(value: string) {
-    setConfig({
-      ...config,
-      companyUpstream: {
-        ...config.companyUpstream,
-        port: sanitizePort(value),
-      },
-    });
-  }
-
   function updatePersonalPort(value: string) {
     setConfig({
       ...config,
@@ -916,6 +915,7 @@ export function App() {
     : summarizeRules(config.rules);
   const recentLogs = logs.slice(-4).reverse();
   const blockingCheck = firstBlockingCheck(preflight);
+  const warningCheck = preflight?.checks.find((item) => item.status === "warn") ?? null;
   const preflightModeHint =
     preflight && preflight.effectiveMode !== preflight.requestedMode
       ? `将以 ${formatPreflightMode(preflight.effectiveMode)} 启动`
@@ -949,8 +949,8 @@ export function App() {
 
             <div className="app-header__right">
               <HeaderStatusChip
-                label="公司代理"
-                value={String(config.companyUpstream.port)}
+                label="公司出口"
+                value="系统路由"
                 tone="company"
               />
               <HeaderStatusChip
@@ -969,7 +969,7 @@ export function App() {
             <section className="config-panel">
               <div className="section-heading">
                 <h2>代理配置</h2>
-                <p>公司流量走公司代理，其余走个人代理</p>
+                <p>公司流量复用系统路由 / 公司 VPN，其余流量走个人代理</p>
               </div>
 
               <div className="port-grid">
@@ -977,25 +977,18 @@ export function App() {
                   <div className="port-card__title">
                     <span className="port-card__marker port-card__marker--company">C</span>
                     <div>
-                      <h3>公司代理端口</h3>
-                      <p>通常由公司 VPN 客户端提供</p>
+                      <h3>公司网络出口</h3>
+                      <p>自动复用系统路由和现有公司 VPN，不再配置公司代理端口</p>
                     </div>
                   </div>
-                  <div className="input-shell">
-                    <input
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={config.companyUpstream.port}
-                      onChange={(event) => updateCompanyPort(event.target.value)}
-                      disabled={isBusy}
-                    />
+                  <div className="input-shell input-shell--static">
+                    <div className="static-field">系统路由 / 公司 VPN</div>
                     <span className="protocol-pill">
-                      {formatProtocol(health?.company?.protocol || config.companyUpstream.protocol)}
+                      {formatProtocol(health?.company?.protocol || "direct")}
                     </span>
                   </div>
                   <p className="field-hint">
-                    {healthHint(health?.company, config.companyUpstream.protocol)}
+                    {healthHint(health?.company, "direct")}
                   </p>
                 </article>
 
@@ -1030,7 +1023,7 @@ export function App() {
                 <div className="rules-panel__header">
                   <div>
                     <h3>公司规则</h3>
-                    <p>定义哪些域名 / IP 走公司代理，支持域名后缀、完整域名、关键词和 CIDR</p>
+                    <p>定义哪些域名 / IP 走公司网络，命中后直接复用系统路由，其他流量走个人代理</p>
                   </div>
                   <div className="rules-actions">
                     <button type="button" className="text-button" onClick={applyRuleExample}>
@@ -1097,8 +1090,13 @@ export function App() {
                     <strong>{formatPreflightMode(preflight.effectiveMode)}</strong>
                   </div>
                   <p className="preflight-card__reason">{preflight.modeReason}</p>
+                  {preflight.autoRecovered && preflight.recoveryMessage ? (
+                    <p className="preflight-card__info">{preflight.recoveryMessage}</p>
+                  ) : null}
                   {blockingCheck ? (
                     <p className="preflight-card__warning">{blockingCheck.message}</p>
+                  ) : warningCheck ? (
+                    <p className="preflight-card__info">{warningCheck.message}</p>
                   ) : null}
                   {preflight.recoveryRequired ? (
                     <button type="button" className="btn btn-outline preflight-card__button" onClick={recoverNetwork} disabled={isRecovering}>

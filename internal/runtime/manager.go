@@ -106,14 +106,33 @@ func (m *Manager) RunPreflight(cfg api.Config) (api.PreflightReport, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	autoRecovered, err := m.tryAutoRecoverLocked(ctx, cfg)
+	if err != nil {
+		m.logger.Warn("runtime", "自动恢复残留网络状态失败", map[string]any{"error": err.Error()})
+	}
+
 	state := m.evaluatePreflight(ctx, cfg)
 	m.cfg = state.resolvedConfig
 	m.health = state.health
 	report := state.report
+	if autoRecovered {
+		report.AutoRecovered = true
+		report.RecoveryMessage = "检测到上次退出遗留的网络状态，已自动恢复系统代理和 DNS"
+	}
 	m.applyPreflightToStatus(report)
 	m.emitHealth()
 	m.emitStatus()
 	return report, nil
+}
+
+func (m *Manager) EnsureRecovered(cfg api.Config) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	return m.tryAutoRecoverLocked(ctx, cfg)
 }
 
 func (m *Manager) RecoverNetwork() error {
@@ -123,46 +142,17 @@ func (m *Manager) RecoverNetwork() error {
 	if m.status.State == api.RuntimeStateRunning || m.status.State == api.RuntimeStateStarting || m.status.State == api.RuntimeStateStopping {
 		return api.NewError(api.ErrCodeRuntimeAlreadyRunning, "运行时正在运行，无法执行网络恢复")
 	}
-	if !m.journal.Exists() {
-		m.status.RecoveryRequired = false
-		m.status.LastErrorCode = ""
-		m.status.LastErrorMessage = ""
-		m.emitStatus()
-		return nil
-	}
-
-	snapshot, err := m.journal.Load()
-	if err != nil {
-		m.status.RecoveryRequired = true
-		m.status.LastErrorCode = api.ErrorCode(err)
-		m.status.LastErrorMessage = err.Error()
-		m.emitStatus()
-		return err
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := m.platform.RecoverNetwork(ctx, snapshot); err != nil {
-		wrapped := api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统网络状态失败", err)
-		m.status.RecoveryRequired = true
-		m.status.LastErrorCode = wrapped.Code
-		m.status.LastErrorMessage = wrapped.Error()
-		m.emitStatus()
-		return wrapped
-	}
-	if err := m.journal.Remove(); err != nil {
-		m.status.RecoveryRequired = true
-		m.status.LastErrorCode = api.ErrorCode(err)
-		m.status.LastErrorMessage = err.Error()
-		m.emitStatus()
+	_, err := m.recoverNetworkLocked(ctx, m.cfg)
+	if err != nil {
 		return err
 	}
-
-	m.status = api.RuntimeStatus{
-		State:         api.RuntimeStateIdle,
-		Mode:          requestedMode(m.cfg),
-		RequestedMode: requestedMode(m.cfg),
-	}
+	// 恢复成功后清除残留的错误状态，确保前端不再显示旧错误
+	m.status.LastErrorCode = ""
+	m.status.LastErrorMessage = ""
+	m.status.RecoveryRequired = false
 	m.emitStatus()
 	return nil
 }
@@ -179,6 +169,10 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	if _, err := m.tryAutoRecoverLocked(ctx, cfg); err != nil {
+		m.logger.Warn("runtime", "启动前自动恢复残留网络状态失败", map[string]any{"error": err.Error()})
+	}
+
 	state := m.evaluatePreflight(ctx, cfg)
 	m.cfg = state.resolvedConfig
 	m.health = state.health
@@ -193,6 +187,18 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		m.status.LastErrorMessage = firstFailureMessage(report.Checks)
 		m.emitStatus()
 		return m.status, api.NewError(api.ErrCodePreflightFailed, m.status.LastErrorMessage)
+	}
+
+	// 启动时必须确保个人代理已就绪（预检仅 warn，此处硬检查）
+	if cfg.PersonalUpstream.Protocol != api.ProtocolDirect {
+		personalRecheck := ProbeUpstream(ctx, cfg.PersonalUpstream)
+		if !personalRecheck.Reachable {
+			m.status.State = api.RuntimeStateIdle
+			m.status.LastErrorCode = api.ErrCodeUpstreamUnavailable
+			m.status.LastErrorMessage = "个人代理端口不可达，请先启动个人 VPN"
+			m.emitStatus()
+			return m.status, api.NewError(api.ErrCodeUpstreamUnavailable, m.status.LastErrorMessage)
+		}
 	}
 
 	snapshot, err := m.platform.CaptureRecoverySnapshot(ctx, report.EffectiveMode)
@@ -286,6 +292,16 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			m.status.LastErrorMessage = err.Error()
 			m.emitStatus()
 			return m.status, err
+		}
+		if snapshot.SystemProxy.Enabled {
+			if err := m.platform.ClearSystemProxy(runCtx); err != nil {
+				m.rollbackLocked(runCtx, false)
+				wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "切换到 TUN 模式前清理系统代理失败", err)
+				m.status.LastErrorCode = wrapped.Code
+				m.status.LastErrorMessage = wrapped.Error()
+				m.emitStatus()
+				return m.status, wrapped
+			}
 		}
 
 		if live, err := m.platform.CaptureRecoverySnapshot(runCtx, report.EffectiveMode); err == nil {
@@ -389,6 +405,64 @@ func (m *Manager) applyPreflightToStatus(report api.PreflightReport) {
 		m.status.LastErrorCode = ""
 		m.status.LastErrorMessage = ""
 	}
+}
+
+func (m *Manager) tryAutoRecoverLocked(ctx context.Context, cfg api.Config) (bool, error) {
+	if runtimeActive(m.status.State) || !m.journal.Exists() {
+		return false, nil
+	}
+	recovered, err := m.recoverNetworkLocked(ctx, cfg)
+	if err != nil {
+		return false, err
+	}
+	if recovered {
+		m.logger.Info("runtime", "检测到残留网络状态并已自动恢复", nil)
+	}
+	return recovered, nil
+}
+
+func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (bool, error) {
+	if !m.journal.Exists() {
+		m.status.RecoveryRequired = false
+		m.status.LastErrorCode = ""
+		m.status.LastErrorMessage = ""
+		m.emitStatus()
+		return false, nil
+	}
+
+	snapshot, err := m.journal.Load()
+	if err != nil {
+		m.status.RecoveryRequired = true
+		m.status.LastErrorCode = api.ErrorCode(err)
+		m.status.LastErrorMessage = err.Error()
+		m.emitStatus()
+		return false, err
+	}
+
+	if err := m.platform.RecoverNetwork(ctx, snapshot); err != nil {
+		wrapped := api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统网络状态失败", err)
+		m.status.RecoveryRequired = true
+		m.status.LastErrorCode = wrapped.Code
+		m.status.LastErrorMessage = wrapped.Error()
+		m.emitStatus()
+		return false, wrapped
+	}
+	if err := m.journal.Remove(); err != nil {
+		m.status.RecoveryRequired = true
+		m.status.LastErrorCode = api.ErrorCode(err)
+		m.status.LastErrorMessage = err.Error()
+		m.emitStatus()
+		return false, err
+	}
+
+	mode := requestedMode(cfg)
+	m.status = api.RuntimeStatus{
+		State:         api.RuntimeStateIdle,
+		Mode:          mode,
+		RequestedMode: mode,
+	}
+	m.emitStatus()
+	return true, nil
 }
 
 func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {

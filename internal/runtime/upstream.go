@@ -17,14 +17,22 @@ type Upstream struct {
 	Health api.UpstreamHealth
 }
 
+func systemRouteHealth() api.UpstreamHealth {
+	now := time.Now()
+	return api.UpstreamHealth{
+		Reachable:     true,
+		Protocol:      api.ProtocolDirect,
+		LastSuccessAt: now,
+		RTTMs:         0,
+	}
+}
+
 func ProbeUpstream(ctx context.Context, cfg api.UpstreamConfig) api.UpstreamHealth {
 	start := time.Now()
 	health := api.UpstreamHealth{Protocol: api.ProtocolUnknown}
 
 	if cfg.Protocol == api.ProtocolDirect {
-		health.Reachable = true
-		health.Protocol = api.ProtocolDirect
-		health.LastSuccessAt = time.Now()
+		health = systemRouteHealth()
 		health.RTTMs = time.Since(start).Milliseconds()
 		return health
 	}

@@ -90,6 +90,8 @@ export type PreflightReport = {
   modeReason: string;
   canStart: boolean;
   recoveryRequired: boolean;
+  autoRecovered?: boolean;
+  recoveryMessage?: string;
   checks: PreflightCheck[];
 };
 

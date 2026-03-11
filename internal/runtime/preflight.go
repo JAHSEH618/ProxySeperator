@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/friedhelmliu/ProxySeperator/internal/api"
@@ -40,10 +39,6 @@ func failCheck(id, code, message string) api.PreflightCheck {
 	return api.PreflightCheck{ID: id, Status: "fail", Code: code, Message: message}
 }
 
-func checkFailed(check api.PreflightCheck) bool {
-	return check.Status == "fail"
-}
-
 func matchesSystemProxyState(state api.SystemProxyState, ours platform.SystemProxyConfig) bool {
 	if !state.Enabled || state.Mixed {
 		return false
@@ -74,33 +69,6 @@ func systemProxyMatchesUpstream(state api.SystemProxyState, upstream api.Upstrea
 	}
 	address := upstream.Address()
 	return state.HTTPAddress == address || state.HTTPSAddress == address || state.SOCKSAddress == address
-}
-
-func isTunnelInterface(name string) bool {
-	lower := strings.ToLower(strings.TrimSpace(name))
-	switch {
-	case strings.HasPrefix(lower, "utun"):
-		return true
-	case strings.HasPrefix(lower, "tun"):
-		return true
-	case strings.HasPrefix(lower, "tap"):
-		return true
-	case strings.HasPrefix(lower, "ppp"):
-		return true
-	case strings.HasPrefix(lower, "wg"):
-		return true
-	default:
-		return false
-	}
-}
-
-func directTunnelHealth() api.UpstreamHealth {
-	now := time.Now()
-	return api.UpstreamHealth{
-		Reachable:     true,
-		Protocol:      api.ProtocolDirect,
-		LastSuccessAt: now,
-	}
 }
 
 func runtimeActive(state string) bool {
@@ -134,26 +102,24 @@ func (m *Manager) evaluatePreflight(ctx context.Context, cfg api.Config) preflig
 
 	personal := ProbeUpstream(ctx, cfg.PersonalUpstream)
 	if !personal.Reachable {
-		checks = append(checks, failCheck(checkPersonalUpstream, api.ErrCodeUpstreamUnavailable, "个人代理端口不可达"))
+		checks = append(checks, warnCheck(checkPersonalUpstream, api.ErrCodeUpstreamUnavailable, "个人代理端口不可达，请确认个人 VPN 已启动"))
 	} else {
 		checks = append(checks, passCheck(checkPersonalUpstream, "个人代理端口可达"))
 	}
 
 	proxyState, proxyErr := m.platform.CurrentSystemProxy(ctx)
-	company := ProbeUpstream(ctx, cfg.CompanyUpstream)
-	defaultEgress, defaultEgressErr := m.platform.DefaultEgressInterface(ctx)
-	companyTunnelCandidate := !company.Reachable && defaultEgressErr == nil && isTunnelInterface(defaultEgress)
+	company := systemRouteHealth()
 	personalProxyActive := proxyErr == nil && systemProxyMatchesUpstream(proxyState, cfg.PersonalUpstream)
-	preferSystemMode := companyTunnelCandidate && personalProxyActive
-	desiredSystemMode := report.RequestedMode == api.ModeSystem || preferSystemMode
+	desiredSystemMode := report.RequestedMode == api.ModeSystem
 	proxyConflict := false
+	enterpriseProxyIncompatible := desiredSystemMode && personalProxyActive && cfg.CompanyUpstream.Protocol == api.ProtocolDirect
 
 	if m.journal.Exists() {
 		if runtimeActive(m.status.State) {
 			checks = append(checks, passCheck(checkNetworkRecovery, "运行中已保存恢复快照，停止时将自动恢复"))
 		} else {
-		report.RecoveryRequired = true
-		checks = append(checks, failCheck(checkNetworkRecovery, api.ErrCodeRecoveryFailed, "发现未完成的网络恢复，请先执行修复网络状态"))
+			report.RecoveryRequired = true
+			checks = append(checks, failCheck(checkNetworkRecovery, api.ErrCodeRecoveryFailed, "发现未完成的网络恢复，请先执行修复网络状态"))
 		}
 	} else {
 		checks = append(checks, passCheck(checkNetworkRecovery, "未发现残留网络状态"))
@@ -168,6 +134,8 @@ func (m *Manager) evaluatePreflight(ctx context.Context, cfg api.Config) preflig
 	} else if desiredSystemMode && proxyState.Enabled && !matchesSystemProxyState(proxyState, m.systemProxyConfig()) && !personalProxyActive {
 		proxyConflict = true
 		checks = append(checks, warnCheck(checkSystemProxyConflict, api.ErrCodeSystemProxyFailed, "检测到外部系统代理已占用，需切换到 TUN 共存模式"))
+	} else if enterpriseProxyIncompatible {
+		checks = append(checks, warnCheck(checkSystemProxyConflict, api.ErrCodeSystemProxyFailed, "检测到个人代理已占用系统代理。公司 NGN 与系统代理冲突，将切换到 TUN 共存模式"))
 	} else if desiredSystemMode && personalProxyActive && !matchesSystemProxyState(proxyState, m.systemProxyConfig()) {
 		checks = append(checks, passCheck(checkSystemProxyConflict, "检测到个人代理已占用系统代理，将接管为分流入口"))
 	} else if desiredSystemMode {
@@ -176,16 +144,8 @@ func (m *Manager) evaluatePreflight(ctx context.Context, cfg api.Config) preflig
 		checks = append(checks, passCheck(checkSystemProxyConflict, "TUN 模式不依赖系统代理接管"))
 	}
 
-	tunRequired := !preferSystemMode && (report.RequestedMode == api.ModeTUN || proxyConflict)
-	if company.Reachable {
-		checks = append(checks, passCheck(checkCompanyUpstream, "公司代理端口可达"))
-	} else if companyTunnelCandidate && !tunRequired {
-		state.resolvedConfig.CompanyUpstream.Protocol = api.ProtocolDirect
-		company = directTunnelHealth()
-		checks = append(checks, passCheck(checkCompanyUpstream, fmt.Sprintf("检测到现有 VPN 默认路由 %s，公司流量将复用系统默认路由", defaultEgress)))
-	} else {
-		checks = append(checks, failCheck(checkCompanyUpstream, api.ErrCodeUpstreamUnavailable, "公司代理端口不可达"))
-	}
+	tunRequired := report.RequestedMode == api.ModeTUN || proxyConflict || enterpriseProxyIncompatible
+	checks = append(checks, passCheck(checkCompanyUpstream, "公司流量将复用系统路由和现有公司 VPN"))
 
 	state.health = api.HealthStatus{
 		CheckedAt: time.Now(),
@@ -198,12 +158,10 @@ func (m *Manager) evaluatePreflight(ctx context.Context, cfg api.Config) preflig
 		checks = append(checks, passCheck(checkTUNEgressPath, "当前模式无需 TUN 出口检测"))
 		report.EffectiveMode = api.ModeSystem
 		switch {
-		case preferSystemMode:
-			report.ModeReason = "检测到现有企业 VPN 默认路由和个人代理系统代理，自动使用系统代理模式分流"
-		case state.resolvedConfig.CompanyUpstream.Protocol == api.ProtocolDirect:
-			report.ModeReason = "检测到现有企业 VPN 默认路由，使用系统代理模式复用默认路由"
+		case personalProxyActive && !matchesSystemProxyState(proxyState, m.systemProxyConfig()):
+			report.ModeReason = "检测到个人 VPN 已占用系统代理，将接管为分流入口"
 		default:
-			report.ModeReason = "未检测到系统代理冲突，使用系统代理模式"
+			report.ModeReason = "公司流量复用系统路由，其余流量走个人代理端口"
 		}
 		report.Checks = checks
 		report.CanStart = preflightCanStart(checks)
@@ -227,9 +185,12 @@ func (m *Manager) evaluatePreflight(ctx context.Context, cfg api.Config) preflig
 	if proxyConflict {
 		report.EffectiveMode = api.ModeTUN
 		report.ModeReason = "检测到外部系统代理占用，自动切换为 TUN 共存模式"
+	} else if enterpriseProxyIncompatible {
+		report.EffectiveMode = api.ModeTUN
+		report.ModeReason = "检测到公司 NGN 与系统代理冲突，自动切换为 TUN 共存模式"
 	} else {
 		report.EffectiveMode = api.ModeTUN
-		report.ModeReason = "按配置使用 TUN 模式"
+		report.ModeReason = "公司流量复用系统路由，其余流量通过个人代理接入 TUN 模式"
 	}
 	report.Checks = checks
 	report.CanStart = preflightCanStart(checks)

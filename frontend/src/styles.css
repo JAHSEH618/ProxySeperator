@@ -324,6 +324,11 @@ textarea:focus {
   position: relative;
 }
 
+.input-shell--static {
+  display: flex;
+  align-items: center;
+}
+
 .input-shell input,
 .route-tester input {
   height: 78px;
@@ -331,6 +336,22 @@ textarea:focus {
   border-radius: 18px;
   font-family: "JetBrains Mono", monospace;
   font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.static-field {
+  width: 100%;
+  min-height: 78px;
+  display: flex;
+  align-items: center;
+  padding: 0 130px 0 22px;
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.92);
+  border: 1px solid var(--border-soft);
+  color: var(--text-primary);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 18px;
   font-weight: 700;
   letter-spacing: 0.02em;
 }
@@ -510,6 +531,16 @@ textarea:focus {
   color: var(--text-primary);
   font-size: 14px;
   line-height: 1.55;
+}
+
+.preflight-card__info {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(29, 143, 90, 0.08);
+  color: var(--status-success);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .preflight-card__warning {

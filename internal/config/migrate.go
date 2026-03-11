@@ -13,15 +13,12 @@ func Migrate(cfg *api.Config) bool {
 		cfg.Version = defaults.Version
 		changed = true
 	}
-	if cfg.CompanyUpstream.Host == "" {
+	if cfg.CompanyUpstream.Host == "" || cfg.CompanyUpstream.Host == "127.0.0.1" {
+		cfg.CompanyUpstream.Protocol = defaults.CompanyUpstream.Protocol
 		cfg.CompanyUpstream.Host = defaults.CompanyUpstream.Host
-		changed = true
-	}
-	if cfg.CompanyUpstream.Port == 0 {
 		cfg.CompanyUpstream.Port = defaults.CompanyUpstream.Port
 		changed = true
-	}
-	if cfg.CompanyUpstream.Protocol == "" {
+	} else if cfg.CompanyUpstream.Protocol != defaults.CompanyUpstream.Protocol {
 		cfg.CompanyUpstream.Protocol = defaults.CompanyUpstream.Protocol
 		changed = true
 	}

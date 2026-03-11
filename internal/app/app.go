@@ -59,6 +59,17 @@ func NewBackendAPI() *BackendAPI {
 		cfg: api.DefaultConfig(),
 	}
 
+	if cfg, err := store.Load(); err == nil {
+		apiService.cfg = cfg
+		if recovered, recoverErr := apiService.manager.EnsureRecovered(cfg); recoverErr != nil {
+			logger.Warn("runtime", "初始化时自动恢复残留网络状态失败", map[string]any{"error": recoverErr.Error()})
+		} else if recovered {
+			logger.Info("runtime", "初始化时已自动恢复残留网络状态", nil)
+		}
+	} else {
+		logger.Warn("config", "初始化时加载配置失败，跳过自动恢复", map[string]any{"error": err.Error()})
+	}
+
 	logger.AddSink(func(entry api.LogEntry) {
 		emitter.Emit(api.EventRuntimeLog, entry)
 	})
@@ -293,11 +304,8 @@ func (b *BackendAPI) ensureConfig() (api.Config, error) {
 }
 
 func validateConfig(cfg api.Config) error {
-	if cfg.CompanyUpstream.Host == "" || cfg.PersonalUpstream.Host == "" {
-		return api.NewError(api.ErrCodeInvalidConfig, "代理 Host 不能为空")
-	}
-	if cfg.CompanyUpstream.Port <= 0 || cfg.CompanyUpstream.Port > 65535 {
-		return api.NewError(api.ErrCodeInvalidConfig, "公司代理端口无效")
+	if strings.TrimSpace(cfg.PersonalUpstream.Host) == "" {
+		return api.NewError(api.ErrCodeInvalidConfig, "个人代理 Host 不能为空")
 	}
 	if cfg.PersonalUpstream.Port <= 0 || cfg.PersonalUpstream.Port > 65535 {
 		return api.NewError(api.ErrCodeInvalidConfig, "个人代理端口无效")

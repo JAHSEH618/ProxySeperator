@@ -280,6 +280,7 @@ func (c *darwinController) RecoverNetwork(ctx context.Context, snapshot api.Reco
 	c.dnsSnapshot = nil
 	c.mu.Unlock()
 
+	// 恢复系统代理（非特权操作，system 和 TUN 模式都可能修改）
 	if len(snapshot.SystemProxyData) > 0 {
 		var states []darwinServiceProxyState
 		if err := json.Unmarshal(snapshot.SystemProxyData, &states); err != nil {
@@ -289,21 +290,30 @@ func (c *darwinController) RecoverNetwork(ctx context.Context, snapshot api.Reco
 			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统代理失败", err)
 		}
 	}
-	if len(snapshot.DNSState) > 0 {
-		var dnsSnapshot map[string][]string
-		if err := json.Unmarshal(snapshot.DNSState, &dnsSnapshot); err != nil {
-			return api.WrapError(api.ErrCodeRecoveryFailed, "解析 DNS 快照失败", err)
+
+	// DNS 和路由仅在 TUN 成功启动后才会被修改。
+	// TUN 启动后 tunState.Interface 会被填入接口名（如 utun8）。
+	// 如果 tunState.Interface 为空，说明 TUN 从未成功启动，DNS 和路由从未被修改，
+	// 无需执行需要管理员特权的恢复操作。
+	tunInterface := snapshot.TUNState.Interface
+	if tunInterface != "" {
+		if len(snapshot.DNSState) > 0 {
+			var dnsSnapshot map[string][]string
+			if err := json.Unmarshal(snapshot.DNSState, &dnsSnapshot); err != nil {
+				return api.WrapError(api.ErrCodeRecoveryFailed, "解析 DNS 快照失败", err)
+			}
+			if len(dnsSnapshot) > 0 {
+				if err := c.restoreDNSServers(ctx, dnsSnapshot); err != nil {
+					return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统 DNS 失败", err)
+				}
+			}
 		}
-		if err := c.restoreDNSServers(ctx, dnsSnapshot); err != nil {
-			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统 DNS 失败", err)
+		if err := c.removeSplitRoutes(ctx, tunInterface); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "删除残留 TUN 路由失败", err)
 		}
+		_ = runPrivileged(ctx, "ifconfig", tunInterface, "down")
 	}
-	if err := c.removeSplitRoutes(ctx, snapshot.TUNState.Interface); err != nil {
-		return api.WrapError(api.ErrCodeRecoveryFailed, "删除残留 TUN 路由失败", err)
-	}
-	if snapshot.TUNState.Interface != "" {
-		_ = run(ctx, "ifconfig", snapshot.TUNState.Interface, "down")
-	}
+
 	if helper != nil {
 		if err := helper.Stop(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			return api.WrapError(api.ErrCodeRecoveryFailed, "停止残留 TUN helper 失败", err)
@@ -377,12 +387,21 @@ func (c *darwinController) StartTUN(ctx context.Context, opts TUNOptions) error 
 		return err
 	}
 	if err := c.configureTUNInterface(ctx, tunInterface); err != nil {
+		if api.ErrorCode(err) == api.ErrCodePermissionDenied {
+			return err
+		}
 		return api.WrapError(api.ErrCodeTUNUnavailable, "配置 utun 接口失败", err)
 	}
 	if err := c.installSplitRoutes(ctx, tunInterface); err != nil {
+		if api.ErrorCode(err) == api.ErrCodePermissionDenied {
+			return err
+		}
 		return api.WrapError(api.ErrCodeTUNUnavailable, "写入 TUN 路由失败", err)
 	}
 	if err := c.applyLocalDNS(ctx, services, opts.DNSListenAddress); err != nil {
+		if api.ErrorCode(err) == api.ErrCodePermissionDenied {
+			return err
+		}
 		return api.WrapError(api.ErrCodeSystemProxyFailed, "切换系统 DNS 到本地解析器失败", err)
 	}
 
@@ -420,7 +439,7 @@ func (c *darwinController) StopTUN(ctx context.Context) error {
 		firstErr = api.WrapError(api.ErrCodeTUNUnavailable, "删除 TUN 路由失败", err)
 	}
 	if tunInterface != "" {
-		_ = run(ctx, "ifconfig", tunInterface, "down")
+		_ = runPrivileged(ctx, "ifconfig", tunInterface, "down")
 	}
 	if err := helper.Stop(ctx); err != nil && !errors.Is(err, context.Canceled) && firstErr == nil {
 		firstErr = api.WrapError(api.ErrCodeTUNUnavailable, "停止 TUN helper 失败", err)
@@ -432,7 +451,7 @@ func (c *darwinController) cleanupFailedStart(ctx context.Context, helper *tunHe
 	_ = c.restoreDNSServers(ctx, dnsSnapshot)
 	_ = c.removeSplitRoutes(ctx, tunInterface)
 	if tunInterface != "" {
-		_ = run(ctx, "ifconfig", tunInterface, "down")
+		_ = runPrivileged(ctx, "ifconfig", tunInterface, "down")
 	}
 	if helper != nil {
 		_ = helper.Stop(ctx)
@@ -440,12 +459,12 @@ func (c *darwinController) cleanupFailedStart(ctx context.Context, helper *tunHe
 }
 
 func (c *darwinController) configureTUNInterface(ctx context.Context, name string) error {
-	return run(ctx, "ifconfig", name, "inet", darwinTUNAddress, darwinTUNAddress, "up")
+	return runPrivileged(ctx, "ifconfig", name, "inet", darwinTUNAddress, darwinTUNAddress, "up")
 }
 
 func (c *darwinController) installSplitRoutes(ctx context.Context, tunInterface string) error {
 	for _, route := range darwinSplitRoutes {
-		if err := run(ctx, "route", "-n", "add", "-net", route, "-interface", tunInterface); err != nil {
+		if err := runPrivileged(ctx, "route", "-n", "add", "-net", route, "-interface", tunInterface); err != nil {
 			return err
 		}
 	}
@@ -458,7 +477,7 @@ func (c *darwinController) removeSplitRoutes(ctx context.Context, tunInterface s
 	}
 	var firstErr error
 	for _, route := range darwinSplitRoutes {
-		if err := run(ctx, "route", "-n", "delete", "-net", route, "-interface", tunInterface); err != nil && firstErr == nil {
+		if err := runPrivileged(ctx, "route", "-n", "delete", "-net", route, "-interface", tunInterface); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -527,7 +546,7 @@ func (c *darwinController) setDNSServers(ctx context.Context, service string, se
 	} else {
 		args = append(args, servers...)
 	}
-	return run(ctx, "networksetup", args...)
+	return runPrivileged(ctx, "networksetup", args...)
 }
 
 func (c *darwinController) captureSystemProxySnapshot(ctx context.Context) ([]darwinServiceProxyState, error) {
@@ -700,4 +719,12 @@ func run(ctx context.Context, name string, args ...string) error {
 		return fmt.Errorf("%w: %s", err, trimmed)
 	}
 	return err
+}
+
+func runPrivileged(ctx context.Context, name string, args ...string) error {
+	output, err := runDarwinPrivilegedShell(ctx, buildShellCommand(name, args...))
+	if err == nil {
+		return nil
+	}
+	return wrapPrivilegedCommandError("未授予 macOS 管理员权限，无法修改系统网络设置", err, output)
 }
