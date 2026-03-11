@@ -8,6 +8,8 @@ import (
 
 type BackendAPIInterface interface {
 	LoadConfig(context.Context) (api.Config, error)
+	RunPreflight(context.Context) (api.PreflightReport, error)
+	RecoverNetwork(context.Context) error
 	SaveConfig(context.Context, api.Config) error
 	Start(context.Context) (api.RuntimeStatus, error)
 	Stop(context.Context) error

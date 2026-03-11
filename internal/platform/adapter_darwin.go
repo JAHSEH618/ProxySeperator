@@ -4,6 +4,7 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -24,9 +25,22 @@ const (
 )
 
 var (
-	darwinNameserverPattern = regexp.MustCompile(`nameserver\[\d+\]\s*:\s*(\S+)`)
-	darwinSplitRoutes       = []string{"0.0.0.0/1", "128.0.0.0/1"}
+	darwinNameserverPattern   = regexp.MustCompile(`nameserver\[\d+\]\s*:\s*(\S+)`)
+	darwinDefaultIfacePattern = regexp.MustCompile(`interface:\s+(\S+)`)
+	darwinSplitRoutes         = []string{"0.0.0.0/1", "128.0.0.0/1"}
 )
+
+type darwinProxyEntry struct {
+	Enabled bool   `json:"enabled"`
+	Address string `json:"address,omitempty"`
+}
+
+type darwinServiceProxyState struct {
+	Service string           `json:"service"`
+	Web     darwinProxyEntry `json:"web"`
+	Secure  darwinProxyEntry `json:"secure"`
+	SOCKS   darwinProxyEntry `json:"socks"`
+}
 
 type darwinController struct {
 	logger *logging.Logger
@@ -133,6 +147,14 @@ func (c *darwinController) DisableAutoStart(context.Context) error {
 	return nil
 }
 
+func (c *darwinController) CurrentSystemProxy(ctx context.Context) (api.SystemProxyState, error) {
+	states, err := c.captureSystemProxySnapshot(ctx)
+	if err != nil {
+		return api.SystemProxyState{}, err
+	}
+	return summarizeDarwinProxyState(states), nil
+}
+
 func (c *darwinController) CurrentDNSResolvers(ctx context.Context) ([]string, error) {
 	output, err := exec.CommandContext(ctx, "scutil", "--dns").Output()
 	if err != nil {
@@ -157,6 +179,110 @@ func (c *darwinController) CurrentDNSResolvers(ctx context.Context) ([]string, e
 	return resolvers, nil
 }
 
+func (c *darwinController) CaptureRecoverySnapshot(ctx context.Context, mode string) (api.RecoverySnapshot, error) {
+	proxyStates, err := c.captureSystemProxySnapshot(ctx)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+	proxyData, err := json.Marshal(proxyStates)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+	services, err := c.listNetworkServices(ctx)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+	dnsSnapshot, err := c.snapshotDNSServers(ctx, services)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+	dnsData, err := json.Marshal(dnsSnapshot)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+
+	c.mu.Lock()
+	tunState := api.TUNRecoveryState{}
+	if c.tunInterface != "" {
+		tunState = api.TUNRecoveryState{
+			Interface: c.tunInterface,
+			Routes:    append([]string(nil), darwinSplitRoutes...),
+		}
+	}
+	c.mu.Unlock()
+
+	return api.RecoverySnapshot{
+		Platform:        "darwin",
+		Mode:            mode,
+		SystemProxy:     summarizeDarwinProxyState(proxyStates),
+		SystemProxyData: proxyData,
+		DNSState:        dnsData,
+		TUNState:        tunState,
+	}, nil
+}
+
+func (c *darwinController) RecoverNetwork(ctx context.Context, snapshot api.RecoverySnapshot) error {
+	c.mu.Lock()
+	helper := c.tun
+	c.tun = nil
+	c.tunInterface = ""
+	c.dnsSnapshot = nil
+	c.mu.Unlock()
+
+	if len(snapshot.SystemProxyData) > 0 {
+		var states []darwinServiceProxyState
+		if err := json.Unmarshal(snapshot.SystemProxyData, &states); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "解析系统代理快照失败", err)
+		}
+		if err := c.restoreSystemProxySnapshot(ctx, states); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统代理失败", err)
+		}
+	}
+	if len(snapshot.DNSState) > 0 {
+		var dnsSnapshot map[string][]string
+		if err := json.Unmarshal(snapshot.DNSState, &dnsSnapshot); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "解析 DNS 快照失败", err)
+		}
+		if err := c.restoreDNSServers(ctx, dnsSnapshot); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统 DNS 失败", err)
+		}
+	}
+	if err := c.removeSplitRoutes(ctx, snapshot.TUNState.Interface); err != nil {
+		return api.WrapError(api.ErrCodeRecoveryFailed, "删除残留 TUN 路由失败", err)
+	}
+	if snapshot.TUNState.Interface != "" {
+		_ = run(ctx, "ifconfig", snapshot.TUNState.Interface, "down")
+	}
+	if helper != nil {
+		if err := helper.Stop(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "停止残留 TUN helper 失败", err)
+		}
+	}
+	return nil
+}
+
+func (c *darwinController) DefaultEgressInterface(ctx context.Context) (string, error) {
+	output, err := exec.CommandContext(ctx, "route", "-n", "get", "default").CombinedOutput()
+	if err != nil {
+		return "", api.WrapError(api.ErrCodeTUNUnavailable, "读取默认出口接口失败", err)
+	}
+	matches := darwinDefaultIfacePattern.FindStringSubmatch(string(output))
+	if len(matches) != 2 {
+		return "", api.NewError(api.ErrCodeTUNUnavailable, "未识别默认出口接口")
+	}
+	return strings.TrimSpace(matches[1]), nil
+}
+
+func (c *darwinController) ValidateTUN(ctx context.Context) error {
+	if _, err := c.listNetworkServices(ctx); err != nil {
+		return err
+	}
+	if _, err := c.CurrentDNSResolvers(ctx); err != nil {
+		return api.WrapError(api.ErrCodeTUNUnavailable, "读取系统 DNS 失败", err)
+	}
+	return nil
+}
+
 func (c *darwinController) StartTUN(ctx context.Context, opts TUNOptions) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -177,6 +303,7 @@ func (c *darwinController) StartTUN(ctx context.Context, opts TUNOptions) error 
 	helper, err := startTUNHelper(ctx, c.logger, tunHelperOptions{
 		Device:     darwinTUNDevice,
 		Proxy:      "socks5://" + opts.SOCKSListenAddress,
+		Interface:  opts.EgressInterface,
 		LogLevel:   "info",
 		MTU:        maxInt(opts.MTU, 1500),
 		UDPTimeout: 30 * time.Second,
@@ -350,6 +477,146 @@ func (c *darwinController) setDNSServers(ctx context.Context, service string, se
 		args = append(args, servers...)
 	}
 	return run(ctx, "networksetup", args...)
+}
+
+func (c *darwinController) captureSystemProxySnapshot(ctx context.Context) ([]darwinServiceProxyState, error) {
+	services, err := c.listNetworkServices(ctx)
+	if err != nil {
+		return nil, err
+	}
+	states := make([]darwinServiceProxyState, 0, len(services))
+	for _, service := range services {
+		web, err := c.getProxyEntry(ctx, service, "-getwebproxy")
+		if err != nil {
+			return nil, err
+		}
+		secure, err := c.getProxyEntry(ctx, service, "-getsecurewebproxy")
+		if err != nil {
+			return nil, err
+		}
+		socks, err := c.getProxyEntry(ctx, service, "-getsocksfirewallproxy")
+		if err != nil {
+			return nil, err
+		}
+		states = append(states, darwinServiceProxyState{
+			Service: service,
+			Web:     web,
+			Secure:  secure,
+			SOCKS:   socks,
+		})
+	}
+	return states, nil
+}
+
+func summarizeDarwinProxyState(states []darwinServiceProxyState) api.SystemProxyState {
+	httpValues := make(map[string]struct{})
+	httpsValues := make(map[string]struct{})
+	socksValues := make(map[string]struct{})
+	summary := api.SystemProxyState{}
+	for _, state := range states {
+		if state.Web.Enabled {
+			summary.Enabled = true
+			httpValues[state.Web.Address] = struct{}{}
+		}
+		if state.Secure.Enabled {
+			summary.Enabled = true
+			httpsValues[state.Secure.Address] = struct{}{}
+		}
+		if state.SOCKS.Enabled {
+			summary.Enabled = true
+			socksValues[state.SOCKS.Address] = struct{}{}
+		}
+	}
+	if len(httpValues) == 1 {
+		for value := range httpValues {
+			summary.HTTPAddress = value
+		}
+	}
+	if len(httpsValues) == 1 {
+		for value := range httpsValues {
+			summary.HTTPSAddress = value
+		}
+	}
+	if len(socksValues) == 1 {
+		for value := range socksValues {
+			summary.SOCKSAddress = value
+		}
+	}
+	if len(httpValues) > 1 || len(httpsValues) > 1 || len(socksValues) > 1 {
+		summary.Mixed = true
+	}
+	return summary
+}
+
+func (c *darwinController) getProxyEntry(ctx context.Context, service, command string) (darwinProxyEntry, error) {
+	output, err := exec.CommandContext(ctx, "networksetup", command, service).CombinedOutput()
+	if err != nil {
+		return darwinProxyEntry{}, api.WrapError(api.ErrCodeSystemProxyFailed, "读取系统代理状态失败", err)
+	}
+	entry := darwinProxyEntry{}
+	lines := strings.Split(string(output), "\n")
+	server := ""
+	port := ""
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "Enabled:"):
+			entry.Enabled = strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(line, "Enabled:")), "yes")
+		case strings.HasPrefix(line, "Server:"):
+			server = strings.TrimSpace(strings.TrimPrefix(line, "Server:"))
+		case strings.HasPrefix(line, "Port:"):
+			port = strings.TrimSpace(strings.TrimPrefix(line, "Port:"))
+		}
+	}
+	if server != "" && port != "" {
+		entry.Address = server + ":" + port
+	}
+	return entry, nil
+}
+
+func (c *darwinController) restoreSystemProxySnapshot(ctx context.Context, states []darwinServiceProxyState) error {
+	for _, state := range states {
+		if err := c.restoreServiceProxy(ctx, state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *darwinController) restoreServiceProxy(ctx context.Context, state darwinServiceProxyState) error {
+	if err := c.applyProxyEntry(ctx, state.Service, state.Web, "-setwebproxy", "-setwebproxystate"); err != nil {
+		return err
+	}
+	if err := c.applyProxyEntry(ctx, state.Service, state.Secure, "-setsecurewebproxy", "-setsecurewebproxystate"); err != nil {
+		return err
+	}
+	if err := c.applyProxyEntry(ctx, state.Service, state.SOCKS, "-setsocksfirewallproxy", "-setsocksfirewallproxystate"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *darwinController) applyProxyEntry(ctx context.Context, service string, entry darwinProxyEntry, setCommand string, stateCommand string) error {
+	if entry.Enabled {
+		host, port, err := splitHostPort(entry.Address)
+		if err != nil {
+			return api.WrapError(api.ErrCodeSystemProxyFailed, "恢复系统代理地址失败", err)
+		}
+		if err := run(ctx, "networksetup", setCommand, service, host, port); err != nil {
+			return api.WrapError(api.ErrCodeSystemProxyFailed, "恢复系统代理失败", err)
+		}
+		if err := run(ctx, "networksetup", stateCommand, service, "on"); err != nil {
+			return api.WrapError(api.ErrCodeSystemProxyFailed, "恢复系统代理状态失败", err)
+		}
+		return nil
+	}
+	if err := run(ctx, "networksetup", stateCommand, service, "off"); err != nil {
+		return api.WrapError(api.ErrCodeSystemProxyFailed, "关闭系统代理状态失败", err)
+	}
+	return nil
 }
 
 func (c *darwinController) listNetworkServices(ctx context.Context) ([]string, error) {

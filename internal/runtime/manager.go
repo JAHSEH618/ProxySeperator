@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ const (
 	defaultHTTPProxyListen  = "127.0.0.1:17900"
 	defaultSOCKSProxyListen = "127.0.0.1:17901"
 	defaultDNSListen        = "127.0.0.1:18553"
+	defaultRecoveryJournal  = "recovery-journal.json"
 )
 
 type Manager struct {
@@ -32,6 +34,7 @@ type Manager struct {
 	dnsCache        *localdns.Cache
 	dns             *localdns.Server
 	stats           *StatsTracker
+	journal         *recoveryJournal
 
 	forwarder *Forwarder
 	httpProxy *proxy.HTTPServer
@@ -44,10 +47,11 @@ type Manager struct {
 }
 
 type Options struct {
-	Platform        platform.Controller
-	HTTPListenAddr  string
-	SOCKSListenAddr string
-	DNSListenAddr   string
+	Platform            platform.Controller
+	HTTPListenAddr      string
+	SOCKSListenAddr     string
+	DNSListenAddr       string
+	RecoveryJournalPath string
 }
 
 func NewManager(logger *logging.Logger, emitter EventEmitter) *Manager {
@@ -71,6 +75,11 @@ func NewManagerWithOptions(logger *logging.Logger, emitter EventEmitter, opts Op
 	if opts.DNSListenAddr == "" {
 		opts.DNSListenAddr = defaultDNSListen
 	}
+	if opts.RecoveryJournalPath == "" {
+		if dir, err := os.UserConfigDir(); err == nil {
+			opts.RecoveryJournalPath = filepath.Join(dir, api.AppName, defaultRecoveryJournal)
+		}
+	}
 	return &Manager{
 		logger:          logger,
 		emitter:         emitter,
@@ -80,11 +89,79 @@ func NewManagerWithOptions(logger *logging.Logger, emitter EventEmitter, opts Op
 		dnsListenAddr:   opts.DNSListenAddr,
 		dnsCache:        localdns.NewCache(),
 		stats:           NewStatsTracker(),
+		journal:         newRecoveryJournal(opts.RecoveryJournalPath),
 		status: api.RuntimeStatus{
-			State: api.RuntimeStateIdle,
-			Mode:  api.ModeSystem,
+			State:         api.RuntimeStateIdle,
+			Mode:          api.ModeSystem,
+			RequestedMode: api.ModeSystem,
 		},
 	}
+}
+
+func (m *Manager) RunPreflight(cfg api.Config) (api.PreflightReport, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.cfg = cfg
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	report := m.runPreflight(ctx, cfg)
+	m.applyPreflightToStatus(report)
+	m.emitHealth()
+	m.emitStatus()
+	return report, nil
+}
+
+func (m *Manager) RecoverNetwork() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.status.State == api.RuntimeStateRunning || m.status.State == api.RuntimeStateStarting || m.status.State == api.RuntimeStateStopping {
+		return api.NewError(api.ErrCodeRuntimeAlreadyRunning, "运行时正在运行，无法执行网络恢复")
+	}
+	if !m.journal.Exists() {
+		m.status.RecoveryRequired = false
+		m.status.LastErrorCode = ""
+		m.status.LastErrorMessage = ""
+		m.emitStatus()
+		return nil
+	}
+
+	snapshot, err := m.journal.Load()
+	if err != nil {
+		m.status.RecoveryRequired = true
+		m.status.LastErrorCode = api.ErrorCode(err)
+		m.status.LastErrorMessage = err.Error()
+		m.emitStatus()
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.platform.RecoverNetwork(ctx, snapshot); err != nil {
+		wrapped := api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统网络状态失败", err)
+		m.status.RecoveryRequired = true
+		m.status.LastErrorCode = wrapped.Code
+		m.status.LastErrorMessage = wrapped.Error()
+		m.emitStatus()
+		return wrapped
+	}
+	if err := m.journal.Remove(); err != nil {
+		m.status.RecoveryRequired = true
+		m.status.LastErrorCode = api.ErrorCode(err)
+		m.status.LastErrorMessage = err.Error()
+		m.emitStatus()
+		return err
+	}
+
+	m.status = api.RuntimeStatus{
+		State:         api.RuntimeStateIdle,
+		Mode:          requestedMode(m.cfg),
+		RequestedMode: requestedMode(m.cfg),
+	}
+	m.emitStatus()
+	return nil
 }
 
 func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
@@ -95,36 +172,61 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		return m.status, api.NewError(api.ErrCodeRuntimeAlreadyRunning, "运行时已经启动")
 	}
 
-	parseResult := rules.ParseLines(cfg.Rules)
-	if len(parseResult.Invalid) > 0 {
-		return m.status, api.NewError(api.ErrCodeRuleValidationFailed, "规则校验失败，请先修正无效规则")
-	}
-
-	mode := cfg.Advanced.Mode
-	if cfg.Advanced.TUNEnabled {
-		mode = api.ModeTUN
-	}
-	if mode == "" {
-		mode = api.ModeSystem
-	}
-
 	m.cfg = cfg
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	report := m.runPreflight(ctx, cfg)
+	m.applyPreflightToStatus(report)
+	m.emitHealth()
+	m.emitStatus()
+
+	if !report.CanStart {
+		m.status.State = api.RuntimeStateIdle
+		m.status.LastErrorCode = api.ErrCodePreflightFailed
+		m.status.LastErrorMessage = firstFailureMessage(report.Checks)
+		m.emitStatus()
+		return m.status, api.NewError(api.ErrCodePreflightFailed, m.status.LastErrorMessage)
+	}
+
+	snapshot, err := m.platform.CaptureRecoverySnapshot(ctx, report.EffectiveMode)
+	if err != nil {
+		wrapped := api.WrapError(api.ErrCodeRecoveryFailed, "写入恢复快照前读取系统状态失败", err)
+		m.status.State = api.RuntimeStateIdle
+		m.status.LastErrorCode = wrapped.Code
+		m.status.LastErrorMessage = wrapped.Error()
+		m.emitStatus()
+		return m.status, wrapped
+	}
+	snapshot.Mode = report.EffectiveMode
+	snapshot.WrittenAt = time.Now()
+	if err := m.journal.Save(snapshot); err != nil {
+		m.status.State = api.RuntimeStateIdle
+		m.status.LastErrorCode = api.ErrorCode(err)
+		m.status.LastErrorMessage = err.Error()
+		m.emitStatus()
+		return m.status, err
+	}
+
 	m.status = api.RuntimeStatus{
-		State: api.RuntimeStateStarting,
-		Mode:  mode,
+		State:         api.RuntimeStateStarting,
+		Mode:          report.EffectiveMode,
+		RequestedMode: report.RequestedMode,
+		ModeReason:    report.ModeReason,
 	}
 	m.emitStatus()
 
-	matcher := rules.NewMatcher(parseResult.Compiled)
+	matcher := rules.NewMatcher(rules.ParseLines(cfg.Rules).Compiled)
 	m.forwarder = NewForwarder(cfg, matcher, m.dnsCache, m.stats, m.logger)
 	m.httpProxy = proxy.NewHTTPServer(m.httpListenAddr, m.forwarder, m.logger)
 	m.socks5 = proxy.NewSOCKS5Server(m.socksListenAddr, m.forwarder, m.logger)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	m.cancel = cancel
+	runCtx, runCancel := context.WithCancel(context.Background())
+	m.cancel = runCancel
+
 	dnsResolvers := []string(nil)
-	if mode == api.ModeTUN {
-		resolvers, err := m.platform.CurrentDNSResolvers(ctx)
+	if report.EffectiveMode == api.ModeTUN {
+		resolvers, err := m.platform.CurrentDNSResolvers(runCtx)
 		if err != nil {
 			m.logger.Warn("runtime", "读取系统 DNS 失败，回退到默认公共解析器", map[string]any{"error": err.Error()})
 		} else {
@@ -133,69 +235,86 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	}
 	m.dns = localdns.NewServer(m.dnsListenAddr, m.dnsCache, dnsResolvers, m.logger)
 
-	health := m.forwarder.RefreshHealth(ctx)
-	m.health = health
-	m.emitHealth()
-	if !health.Company.Reachable {
-		m.rollbackLocked(ctx)
-		return m.status, api.NewError(api.ErrCodeUpstreamUnavailable, "公司代理端口不可达")
-	}
-	if !health.Personal.Reachable {
-		m.rollbackLocked(ctx)
-		return m.status, api.NewError(api.ErrCodeUpstreamUnavailable, "个人代理端口不可达")
-	}
-
-	m.stats.Start(mode)
-	if err := m.httpProxy.Start(ctx); err != nil {
-		m.rollbackLocked(ctx)
+	m.stats.Start(report.EffectiveMode)
+	if err := m.httpProxy.Start(runCtx); err != nil {
+		m.rollbackLocked(runCtx, false)
+		m.status.LastErrorCode = api.ErrorCode(err)
+		m.status.LastErrorMessage = err.Error()
+		m.emitStatus()
 		return m.status, err
 	}
-	if err := m.socks5.Start(ctx); err != nil {
-		m.rollbackLocked(ctx)
+	if err := m.socks5.Start(runCtx); err != nil {
+		m.rollbackLocked(runCtx, false)
+		m.status.LastErrorCode = api.ErrorCode(err)
+		m.status.LastErrorMessage = err.Error()
+		m.emitStatus()
 		return m.status, err
 	}
 
-	if mode == api.ModeTUN {
+	if report.EffectiveMode == api.ModeTUN {
 		if err := m.dns.Start(); err != nil {
-			m.rollbackLocked(ctx)
-			return m.status, api.WrapError(api.ErrCodeRuntimeStartFailed, "启动本地 DNS 失败", err)
+			m.rollbackLocked(runCtx, false)
+			wrapped := api.WrapError(api.ErrCodeRuntimeStartFailed, "启动本地 DNS 失败", err)
+			m.status.LastErrorCode = wrapped.Code
+			m.status.LastErrorMessage = wrapped.Error()
+			m.emitStatus()
+			return m.status, wrapped
 		}
-		if err := m.platform.StartTUN(ctx, platform.TUNOptions{
+		egress, err := m.platform.DefaultEgressInterface(runCtx)
+		if err != nil {
+			m.rollbackLocked(runCtx, false)
+			wrapped := api.WrapError(api.ErrCodeTUNUnavailable, "无法识别默认出口接口", err)
+			m.status.LastErrorCode = wrapped.Code
+			m.status.LastErrorMessage = wrapped.Error()
+			m.emitStatus()
+			return m.status, wrapped
+		}
+		if err := m.platform.StartTUN(runCtx, platform.TUNOptions{
 			DNSListenAddress:   m.dnsListenAddr,
 			SOCKSListenAddress: m.socksListenAddr,
+			EgressInterface:    egress,
 			MTU:                1500,
 		}); err != nil {
-			m.rollbackLocked(ctx)
+			m.rollbackLocked(runCtx, false)
+			m.status.LastErrorCode = api.ErrorCode(err)
+			m.status.LastErrorMessage = err.Error()
+			m.emitStatus()
 			return m.status, err
 		}
+
+		if live, err := m.platform.CaptureRecoverySnapshot(runCtx, report.EffectiveMode); err == nil {
+			snapshot.TUNState = live.TUNState
+			snapshot.WrittenAt = time.Now()
+			_ = m.journal.Save(snapshot)
+		}
 	} else {
-		err := m.platform.ApplySystemProxy(ctx, platform.SystemProxyConfig{
-			HTTPAddress:  m.httpListenAddr,
-			HTTPSAddress: m.httpListenAddr,
-			SOCKSAddress: m.socksListenAddr,
-		})
-		if err != nil {
-			m.rollbackLocked(ctx)
+		if err := m.platform.ApplySystemProxy(runCtx, m.systemProxyConfig()); err != nil {
+			m.rollbackLocked(runCtx, false)
+			m.status.LastErrorCode = api.ErrorCode(err)
+			m.status.LastErrorMessage = err.Error()
+			m.emitStatus()
 			return m.status, err
 		}
 	}
 
 	if cfg.Advanced.AutoStart {
 		if exe, err := os.Executable(); err == nil {
-			_ = m.platform.EnableAutoStart(ctx, exe)
+			_ = m.platform.EnableAutoStart(runCtx, exe)
 		}
 	}
 
 	now := time.Now()
 	m.status = api.RuntimeStatus{
 		State:         api.RuntimeStateRunning,
-		Mode:          mode,
+		Mode:          report.EffectiveMode,
+		RequestedMode: report.RequestedMode,
+		ModeReason:    report.ModeReason,
 		StartedAt:     &now,
 		UptimeSeconds: 0,
 	}
 	m.emitStatus()
 	m.emitTraffic()
-	go m.backgroundLoop(ctx)
+	go m.backgroundLoop(runCtx)
 	return m.status, nil
 }
 
@@ -211,7 +330,9 @@ func (m *Manager) Stop() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	m.rollbackLocked(ctx)
+	m.rollbackLocked(ctx, true)
+	m.status.LastErrorCode = ""
+	m.status.LastErrorMessage = ""
 	return nil
 }
 
@@ -253,7 +374,18 @@ func (m *Manager) TestRoute(input string) api.RouteTestResult {
 	return m.forwarder.TestRoute(input)
 }
 
-func (m *Manager) rollbackLocked(ctx context.Context) {
+func (m *Manager) applyPreflightToStatus(report api.PreflightReport) {
+	m.status.RequestedMode = report.RequestedMode
+	m.status.Mode = report.EffectiveMode
+	m.status.ModeReason = report.ModeReason
+	m.status.RecoveryRequired = report.RecoveryRequired
+	if !report.RecoveryRequired {
+		m.status.LastErrorCode = ""
+		m.status.LastErrorMessage = ""
+	}
+}
+
+func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
@@ -274,12 +406,20 @@ func (m *Manager) rollbackLocked(ctx context.Context) {
 	} else {
 		_ = m.platform.ClearSystemProxy(ctx)
 	}
+	m.dns = nil
 	m.dnsCache.Clear()
 	m.stats.Stop()
+	if clearJournal {
+		_ = m.journal.Remove()
+	}
 	mode := m.status.Mode
+	requested := m.status.RequestedMode
+	recoveryRequired := clearJournal && m.journal.Exists()
 	m.status = api.RuntimeStatus{
-		State: api.RuntimeStateIdle,
-		Mode:  mode,
+		State:            api.RuntimeStateIdle,
+		Mode:             mode,
+		RequestedMode:    requested,
+		RecoveryRequired: recoveryRequired,
 	}
 	m.emitStatus()
 }
@@ -321,4 +461,12 @@ func (m *Manager) emitHealth() {
 
 func (m *Manager) emitTraffic() {
 	m.emitter.Emit(api.EventRuntimeTraffic, m.stats.Snapshot(m.status.Mode))
+}
+
+func (m *Manager) systemProxyConfig() platform.SystemProxyConfig {
+	return platform.SystemProxyConfig{
+		HTTPAddress:  m.httpListenAddr,
+		HTTPSAddress: m.httpListenAddr,
+		SOCKSAddress: m.socksListenAddr,
+	}
 }

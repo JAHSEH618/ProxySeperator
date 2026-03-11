@@ -4,6 +4,7 @@ import type {
   Config,
   HealthStatus,
   LogEntry,
+  PreflightReport,
   RouteTestResult,
   RuleValidationResult,
   RuntimeStatus,
@@ -33,6 +34,8 @@ async function call<T>(method: string, ...args: unknown[]): Promise<T> {
 
 export const backend = {
   loadConfig: () => call<Config>("LoadConfig"),
+  runPreflight: () => call<PreflightReport>("RunPreflight"),
+  recoverNetwork: () => call<void>("RecoverNetwork"),
   saveConfig: (config: Config) => call<void>("SaveConfig", config),
   start: () => call<RuntimeStatus>("Start"),
   stop: () => call<void>("Stop"),

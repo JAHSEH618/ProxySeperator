@@ -45,14 +45,17 @@ func NewBackendAPI() *BackendAPI {
 	buffer := logging.NewRingBuffer(500)
 	logger := logging.NewLogger(buffer)
 	emitter := &dynamicEmitter{}
-	manager := runtimeapp.NewManager(logger, emitter)
+	store := config.NewStore(api.AppName)
+	journalPath, _ := store.RecoveryJournalPath()
 
 	apiService := &BackendAPI{
-		store:   config.NewStore(api.AppName),
+		store:   store,
 		logger:  logger,
 		emitter: emitter,
-		manager: manager,
-		cfg:     api.DefaultConfig(),
+		manager: runtimeapp.NewManagerWithOptions(logger, emitter, runtimeapp.Options{
+			RecoveryJournalPath: journalPath,
+		}),
+		cfg: api.DefaultConfig(),
 	}
 
 	logger.AddSink(func(entry api.LogEntry) {
@@ -74,6 +77,18 @@ func (b *BackendAPI) LoadConfig(context.Context) (api.Config, error) {
 	b.cfg = cfg
 	b.mu.Unlock()
 	return cfg, nil
+}
+
+func (b *BackendAPI) RunPreflight(context.Context) (api.PreflightReport, error) {
+	cfg, err := b.ensureConfig()
+	if err != nil {
+		return api.PreflightReport{}, err
+	}
+	return b.manager.RunPreflight(cfg)
+}
+
+func (b *BackendAPI) RecoverNetwork(context.Context) error {
+	return b.manager.RecoverNetwork()
 }
 
 func (b *BackendAPI) SaveConfig(_ context.Context, cfg api.Config) error {

@@ -460,6 +460,66 @@ textarea:focus {
   gap: 16px;
 }
 
+.preflight-card {
+  display: grid;
+  gap: 14px;
+  margin-top: 26px;
+  padding: 18px 20px;
+  border-radius: 22px;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.preflight-card.is-ready {
+  background: linear-gradient(180deg, rgba(232, 247, 239, 0.96) 0%, #fff 100%);
+  border-color: rgba(29, 143, 90, 0.18);
+}
+
+.preflight-card.is-blocked {
+  background: linear-gradient(180deg, rgba(252, 237, 237, 0.96) 0%, #fff 100%);
+  border-color: rgba(200, 74, 74, 0.2);
+}
+
+.preflight-card__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  font-size: 14px;
+}
+
+.preflight-card__row span {
+  color: var(--text-secondary);
+}
+
+.preflight-card__row strong {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.preflight-card__reason {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.preflight-card__warning {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(200, 74, 74, 0.08);
+  color: var(--status-error);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.preflight-card__button {
+  width: 100%;
+}
+
 .traffic-card {
   display: grid;
   gap: 18px;
@@ -814,6 +874,13 @@ textarea:focus {
   justify-content: flex-end;
 }
 
+.action-bar__hint {
+  color: var(--status-warning);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -979,6 +1046,11 @@ textarea:focus {
   .action-bar__buttons {
     width: 100%;
     justify-content: stretch;
+  }
+
+  .action-bar__hint {
+    width: 100%;
+    order: 3;
   }
 
   .action-bar__buttons .btn {

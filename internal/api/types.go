@@ -1,6 +1,9 @@
 package api
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	AppName = "ProxySeparator"
@@ -120,6 +123,9 @@ func DefaultConfig() Config {
 type RuntimeStatus struct {
 	State            string     `json:"state"`
 	Mode             string     `json:"mode"`
+	RequestedMode    string     `json:"requestedMode,omitempty"`
+	ModeReason       string     `json:"modeReason,omitempty"`
+	RecoveryRequired bool       `json:"recoveryRequired,omitempty"`
 	StartedAt        *time.Time `json:"startedAt,omitempty"`
 	UptimeSeconds    int64      `json:"uptimeSeconds"`
 	LastErrorCode    string     `json:"lastErrorCode,omitempty"`
@@ -162,6 +168,47 @@ type RouteTestResult struct {
 	RuleType    string `json:"ruleType"`
 	MatchedRule string `json:"matchedRule,omitempty"`
 	Reason      string `json:"reason,omitempty"`
+}
+
+type PreflightCheck struct {
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message"`
+}
+
+type PreflightReport struct {
+	RequestedMode    string           `json:"requestedMode"`
+	EffectiveMode    string           `json:"effectiveMode"`
+	ModeReason       string           `json:"modeReason"`
+	CanStart         bool             `json:"canStart"`
+	RecoveryRequired bool             `json:"recoveryRequired"`
+	Checks           []PreflightCheck `json:"checks"`
+}
+
+type SystemProxyState struct {
+	Enabled      bool   `json:"enabled"`
+	HTTPAddress  string `json:"httpAddress,omitempty"`
+	HTTPSAddress string `json:"httpsAddress,omitempty"`
+	SOCKSAddress string `json:"socksAddress,omitempty"`
+	Mixed        bool   `json:"mixed,omitempty"`
+}
+
+type TUNRecoveryState struct {
+	Interface       string   `json:"interface,omitempty"`
+	EgressInterface string   `json:"egressInterface,omitempty"`
+	Routes          []string `json:"routes,omitempty"`
+	DNSListen       string   `json:"dnsListen,omitempty"`
+}
+
+type RecoverySnapshot struct {
+	Platform        string           `json:"platform"`
+	Mode            string           `json:"mode"`
+	WrittenAt       time.Time        `json:"writtenAt"`
+	SystemProxy     SystemProxyState `json:"systemProxy"`
+	SystemProxyData json.RawMessage  `json:"systemProxyData,omitempty"`
+	DNSState        json.RawMessage  `json:"dnsState,omitempty"`
+	TUNState        TUNRecoveryState `json:"tunState,omitempty"`
 }
 
 type InvalidRule struct {

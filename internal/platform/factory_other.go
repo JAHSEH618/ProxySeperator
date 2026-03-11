@@ -33,8 +33,28 @@ func (u *unsupportedController) DisableAutoStart(context.Context) error {
 	return nil
 }
 
+func (u *unsupportedController) CurrentSystemProxy(context.Context) (api.SystemProxyState, error) {
+	return api.SystemProxyState{}, api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持系统代理读取")
+}
+
 func (u *unsupportedController) CurrentDNSResolvers(context.Context) ([]string, error) {
 	return nil, api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持 DNS 解析器读取")
+}
+
+func (u *unsupportedController) CaptureRecoverySnapshot(context.Context, string) (api.RecoverySnapshot, error) {
+	return api.RecoverySnapshot{}, api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持网络快照")
+}
+
+func (u *unsupportedController) RecoverNetwork(context.Context, api.RecoverySnapshot) error {
+	return api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持网络恢复")
+}
+
+func (u *unsupportedController) DefaultEgressInterface(context.Context) (string, error) {
+	return "", api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持默认出口检测")
+}
+
+func (u *unsupportedController) ValidateTUN(context.Context) error {
+	return api.NewError(api.ErrCodeTUNUnavailable, "当前平台不支持 TUN")
 }
 
 func (u *unsupportedController) StartTUN(context.Context, TUNOptions) error {

@@ -30,6 +30,14 @@ const (
 
 var windowsSplitRoutes = []string{"0.0.0.0/1", "128.0.0.0/1"}
 
+type windowsSystemProxySnapshot struct {
+	Enabled      bool   `json:"enabled"`
+	HTTPAddress  string `json:"httpAddress,omitempty"`
+	HTTPSAddress string `json:"httpsAddress,omitempty"`
+	SOCKSAddress string `json:"socksAddress,omitempty"`
+	Server       string `json:"server,omitempty"`
+}
+
 type windowsDNSState struct {
 	InterfaceAlias  string   `json:"InterfaceAlias"`
 	ServerAddresses []string `json:"ServerAddresses"`
@@ -101,6 +109,19 @@ func (c *windowsController) DisableAutoStart(_ context.Context) error {
 	return nil
 }
 
+func (c *windowsController) CurrentSystemProxy(_ context.Context) (api.SystemProxyState, error) {
+	snapshot, err := c.readSystemProxySnapshot()
+	if err != nil {
+		return api.SystemProxyState{}, err
+	}
+	return api.SystemProxyState{
+		Enabled:      snapshot.Enabled,
+		HTTPAddress:  snapshot.HTTPAddress,
+		HTTPSAddress: snapshot.HTTPSAddress,
+		SOCKSAddress: snapshot.SOCKSAddress,
+	}, nil
+}
+
 func (c *windowsController) CurrentDNSResolvers(ctx context.Context) ([]string, error) {
 	states, err := c.snapshotDNSServers(ctx)
 	if err != nil {
@@ -128,6 +149,107 @@ func (c *windowsController) CurrentDNSResolvers(ctx context.Context) ([]string, 
 	return resolvers, nil
 }
 
+func (c *windowsController) CaptureRecoverySnapshot(ctx context.Context, mode string) (api.RecoverySnapshot, error) {
+	proxySnapshot, err := c.readSystemProxySnapshot()
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+	proxyData, err := json.Marshal(proxySnapshot)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+	dnsSnapshot, err := c.snapshotDNSServers(ctx)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+	dnsData, err := json.Marshal(dnsSnapshot)
+	if err != nil {
+		return api.RecoverySnapshot{}, err
+	}
+
+	c.mu.Lock()
+	tunState := api.TUNRecoveryState{}
+	if c.tunInterface != "" {
+		tunState = api.TUNRecoveryState{
+			Interface: c.tunInterface,
+			Routes:    append([]string(nil), windowsSplitRoutes...),
+		}
+	}
+	c.mu.Unlock()
+
+	return api.RecoverySnapshot{
+		Platform: "windows",
+		Mode:     mode,
+		SystemProxy: api.SystemProxyState{
+			Enabled:      proxySnapshot.Enabled,
+			HTTPAddress:  proxySnapshot.HTTPAddress,
+			HTTPSAddress: proxySnapshot.HTTPSAddress,
+			SOCKSAddress: proxySnapshot.SOCKSAddress,
+		},
+		SystemProxyData: proxyData,
+		DNSState:        dnsData,
+		TUNState:        tunState,
+	}, nil
+}
+
+func (c *windowsController) RecoverNetwork(ctx context.Context, snapshot api.RecoverySnapshot) error {
+	c.mu.Lock()
+	helper := c.tun
+	c.tun = nil
+	c.tunInterface = ""
+	c.dnsSnapshot = nil
+	c.mu.Unlock()
+
+	if len(snapshot.SystemProxyData) > 0 {
+		var state windowsSystemProxySnapshot
+		if err := json.Unmarshal(snapshot.SystemProxyData, &state); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "解析系统代理快照失败", err)
+		}
+		if err := c.restoreSystemProxy(state); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统代理失败", err)
+		}
+	}
+	if len(snapshot.DNSState) > 0 {
+		var states []windowsDNSState
+		if err := json.Unmarshal(snapshot.DNSState, &states); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "解析 DNS 快照失败", err)
+		}
+		if err := c.restoreDNSServers(ctx, states); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统 DNS 失败", err)
+		}
+	}
+	if err := c.removeSplitRoutes(ctx, snapshot.TUNState.Interface); err != nil {
+		return api.WrapError(api.ErrCodeRecoveryFailed, "删除残留 TUN 路由失败", err)
+	}
+	if err := c.removeTUNAddress(ctx, snapshot.TUNState.Interface); err != nil {
+		return api.WrapError(api.ErrCodeRecoveryFailed, "删除残留 TUN 地址失败", err)
+	}
+	if helper != nil {
+		if err := helper.Stop(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "停止残留 TUN helper 失败", err)
+		}
+	}
+	return nil
+}
+
+func (c *windowsController) DefaultEgressInterface(ctx context.Context) (string, error) {
+	output, err := runPowerShell(ctx, `Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -eq 'Up' } | Sort-Object InterfaceMetric | Select-Object -First 1 -ExpandProperty InterfaceAlias`)
+	if err != nil {
+		return "", api.WrapError(api.ErrCodeTUNUnavailable, "读取默认出口接口失败", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func (c *windowsController) ValidateTUN(ctx context.Context) error {
+	if _, err := c.resolveWintunDirectory(); err != nil {
+		return err
+	}
+	if _, err := c.snapshotDNSServers(ctx); err != nil {
+		return api.WrapError(api.ErrCodeTUNUnavailable, "读取系统 DNS 快照失败", err)
+	}
+	return nil
+}
+
 func (c *windowsController) StartTUN(ctx context.Context, opts TUNOptions) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -148,6 +270,7 @@ func (c *windowsController) StartTUN(ctx context.Context, opts TUNOptions) error
 	helper, err := startTUNHelper(ctx, c.logger, tunHelperOptions{
 		Device:           windowsTUNDevice,
 		Proxy:            "socks5://" + opts.SOCKSListenAddress,
+		Interface:        opts.EgressInterface,
 		LogLevel:         "info",
 		MTU:              maxInt(opts.MTU, 1500),
 		UDPTimeout:       30 * time.Second,
@@ -220,6 +343,103 @@ func (c *windowsController) StopTUN(ctx context.Context) error {
 		firstErr = api.WrapError(api.ErrCodeTUNUnavailable, "停止 TUN helper 失败", err)
 	}
 	return firstErr
+}
+
+func (c *windowsController) readSystemProxySnapshot() (windowsSystemProxySnapshot, error) {
+	key, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsPath, registry.QUERY_VALUE)
+	if err != nil {
+		return windowsSystemProxySnapshot{}, api.WrapError(api.ErrCodeSystemProxyFailed, "读取系统代理配置失败", err)
+	}
+	defer key.Close()
+
+	proxyEnable, _, err := key.GetIntegerValue("ProxyEnable")
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return windowsSystemProxySnapshot{}, api.WrapError(api.ErrCodeSystemProxyFailed, "读取 ProxyEnable 失败", err)
+	}
+	server, _, err := key.GetStringValue("ProxyServer")
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return windowsSystemProxySnapshot{}, api.WrapError(api.ErrCodeSystemProxyFailed, "读取 ProxyServer 失败", err)
+	}
+
+	snapshot := windowsSystemProxySnapshot{
+		Enabled: proxyEnable == 1,
+		Server:  strings.TrimSpace(server),
+	}
+	applyProxyServer(&snapshot, snapshot.Server)
+	return snapshot, nil
+}
+
+func restoreProxyServerString(snapshot windowsSystemProxySnapshot) string {
+	if snapshot.Server != "" {
+		return snapshot.Server
+	}
+	parts := make([]string, 0, 3)
+	if snapshot.HTTPAddress != "" {
+		parts = append(parts, "http="+snapshot.HTTPAddress)
+	}
+	if snapshot.HTTPSAddress != "" {
+		parts = append(parts, "https="+snapshot.HTTPSAddress)
+	}
+	if snapshot.SOCKSAddress != "" {
+		parts = append(parts, "socks="+snapshot.SOCKSAddress)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, ";")
+}
+
+func applyProxyServer(target *windowsSystemProxySnapshot, server string) {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return
+	}
+	if !strings.Contains(server, "=") {
+		target.HTTPAddress = server
+		target.HTTPSAddress = server
+		target.SOCKSAddress = server
+		return
+	}
+	for _, part := range strings.Split(server, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "http":
+			target.HTTPAddress = strings.TrimSpace(value)
+		case "https":
+			target.HTTPSAddress = strings.TrimSpace(value)
+		case "socks", "socks5":
+			target.SOCKSAddress = strings.TrimSpace(value)
+		}
+	}
+}
+
+func (c *windowsController) restoreSystemProxy(snapshot windowsSystemProxySnapshot) error {
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, internetSettingsPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+
+	enabled := uint32(0)
+	if snapshot.Enabled {
+		enabled = 1
+	}
+	if err := key.SetDWordValue("ProxyEnable", enabled); err != nil {
+		return err
+	}
+	server := restoreProxyServerString(snapshot)
+	if server == "" {
+		_ = key.DeleteValue("ProxyServer")
+		return nil
+	}
+	return key.SetStringValue("ProxyServer", server)
 }
 
 func (c *windowsController) cleanupFailedStart(ctx context.Context, helper *tunHelperProcess, tunInterface string, dnsSnapshot []windowsDNSState) {

@@ -30,6 +30,9 @@ export type Config = {
 export type RuntimeStatus = {
   state: string;
   mode: string;
+  requestedMode?: string;
+  modeReason?: string;
+  recoveryRequired?: boolean;
   startedAt?: string;
   uptimeSeconds: number;
   lastErrorCode?: string;
@@ -72,6 +75,22 @@ export type RouteTestResult = {
   ruleType: string;
   matchedRule?: string;
   reason?: string;
+};
+
+export type PreflightCheck = {
+  id: string;
+  status: "pass" | "warn" | "fail";
+  code?: string;
+  message: string;
+};
+
+export type PreflightReport = {
+  requestedMode: string;
+  effectiveMode: string;
+  modeReason: string;
+  canStart: boolean;
+  recoveryRequired: boolean;
+  checks: PreflightCheck[];
 };
 
 export type InvalidRule = {

@@ -5,6 +5,7 @@ import type {
   Config,
   HealthStatus,
   LogEntry,
+  PreflightReport,
   RouteTestResult,
   RuleSummary,
   RuleValidationResult,
@@ -283,6 +284,14 @@ function ruleSummaryFromValidation(summary: RuleSummary): LocalRuleSummary {
   };
 }
 
+function firstBlockingCheck(report: PreflightReport | null) {
+  return report?.checks.find((item) => item.status === "fail") ?? null;
+}
+
+function formatPreflightMode(value?: string) {
+  return value === "tun" ? "TUN 共存模式" : "系统代理模式";
+}
+
 function Icon({ name, className }: { name: IconName; className?: string }) {
   switch (name) {
     case "activity":
@@ -464,6 +473,7 @@ export function App() {
   const [testInput, setTestInput] = useState("git.company.com");
   const [testResult, setTestResult] = useState<RouteTestResult | null>(null);
   const [validation, setValidation] = useState<RuleValidationResult | null>(null);
+  const [preflight, setPreflight] = useState<PreflightReport | null>(null);
   const [validatedRulesKey, setValidatedRulesKey] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
   const [advancedExpanded, setAdvancedExpanded] = useState(true);
@@ -472,6 +482,7 @@ export function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [isRecovering, setIsRecovering] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
   const [isTestingRoute, setIsTestingRoute] = useState(false);
   const logSectionRef = useRef<HTMLDivElement | null>(null);
@@ -502,11 +513,12 @@ export function App() {
     setIsBootstrapping(true);
     try {
       const loadedConfig = await backend.loadConfig();
-      const [nextRuntimeStatus, nextHealth, nextTraffic, nextLogs] = await Promise.all([
+      const [nextRuntimeStatus, nextHealth, nextTraffic, nextLogs, nextPreflight] = await Promise.all([
         backend.getRuntimeStatus(),
         backend.getHealthStatus(),
         backend.getTrafficStats(),
         backend.listLogs(20),
+        backend.runPreflight(),
       ]);
 
       setConfig(loadedConfig);
@@ -515,6 +527,7 @@ export function App() {
       setHealth(nextHealth);
       setTraffic(nextTraffic);
       setLogs(nextLogs);
+      setPreflight(nextPreflight);
       setNotice({ tone: "success", text: "配置与运行状态已同步" });
     } catch (error) {
       setNotice(noticeFromError(error));
@@ -541,7 +554,10 @@ export function App() {
   }
 
   async function saveConfig() {
-    await persistConfig({ successText: "配置已保存" });
+    const saved = await persistConfig({ successText: "配置已保存" });
+    if (saved) {
+      await refreshPreflight();
+    }
   }
 
   async function validateRules() {
@@ -571,14 +587,24 @@ export function App() {
           return;
         }
       }
+      const report = await refreshPreflight();
+      if (!report?.canStart) {
+        setNotice({
+          tone: "error",
+          text: firstBlockingCheck(report)?.message ?? "启动前检查未通过",
+        });
+        return;
+      }
       const status = await backend.start();
-      const [nextHealth, nextTraffic] = await Promise.all([
+      const [nextHealth, nextTraffic, nextPreflight] = await Promise.all([
         backend.getHealthStatus(),
         backend.getTrafficStats(),
+        backend.runPreflight(),
       ]);
       setRuntimeStatus(status);
       setHealth(nextHealth);
       setTraffic(nextTraffic);
+      setPreflight(nextPreflight);
       setNotice({ tone: "success", text: "代理隔离已启动" });
     } catch (error) {
       setNotice(noticeFromError(error));
@@ -591,7 +617,12 @@ export function App() {
     setIsStopping(true);
     try {
       await backend.stop();
-      setRuntimeStatus(await backend.getRuntimeStatus());
+      const [nextRuntimeStatus, nextPreflight] = await Promise.all([
+        backend.getRuntimeStatus(),
+        backend.runPreflight(),
+      ]);
+      setRuntimeStatus(nextRuntimeStatus);
+      setPreflight(nextPreflight);
       setNotice({ tone: "info", text: "代理隔离已停止" });
     } catch (error) {
       setNotice(noticeFromError(error));
@@ -637,6 +668,40 @@ export function App() {
       setNotice({ tone: "success", text: "最近日志已复制" });
     } catch (error) {
       setNotice(noticeFromError(error));
+    }
+  }
+
+  async function refreshPreflight() {
+    try {
+      const report = await backend.runPreflight();
+      setPreflight(report);
+      return report;
+    } catch (error) {
+      setPreflight(null);
+      setNotice(noticeFromError(error));
+      return null;
+    }
+  }
+
+  async function recoverNetwork() {
+    setIsRecovering(true);
+    try {
+      await backend.recoverNetwork();
+      const [nextRuntimeStatus, nextHealth, nextTraffic, nextPreflight] = await Promise.all([
+        backend.getRuntimeStatus(),
+        backend.getHealthStatus(),
+        backend.getTrafficStats(),
+        backend.runPreflight(),
+      ]);
+      setRuntimeStatus(nextRuntimeStatus);
+      setHealth(nextHealth);
+      setTraffic(nextTraffic);
+      setPreflight(nextPreflight);
+      setNotice({ tone: "success", text: "系统网络状态已恢复" });
+    } catch (error) {
+      setNotice(noticeFromError(error));
+    } finally {
+      setIsRecovering(false);
     }
   }
 
@@ -709,6 +774,11 @@ export function App() {
     ? ruleSummaryFromValidation(activeValidation.summary)
     : summarizeRules(config.rules);
   const recentLogs = logs.slice(-4).reverse();
+  const blockingCheck = firstBlockingCheck(preflight);
+  const preflightModeHint =
+    preflight && preflight.effectiveMode !== preflight.requestedMode
+      ? `将以 ${formatPreflightMode(preflight.effectiveMode)} 启动`
+      : "";
 
   const effectiveNotice =
     runtimeStatus.lastErrorMessage?.trim()
@@ -873,6 +943,28 @@ export function App() {
                 <Icon name="activity" className="panel-icon" />
               </div>
 
+              {preflight ? (
+                <section className={`preflight-card ${preflight.canStart ? "is-ready" : "is-blocked"}`}>
+                  <div className="preflight-card__row">
+                    <span>请求模式</span>
+                    <strong>{formatPreflightMode(preflight.requestedMode)}</strong>
+                  </div>
+                  <div className="preflight-card__row">
+                    <span>实际模式</span>
+                    <strong>{formatPreflightMode(preflight.effectiveMode)}</strong>
+                  </div>
+                  <p className="preflight-card__reason">{preflight.modeReason}</p>
+                  {blockingCheck ? (
+                    <p className="preflight-card__warning">{blockingCheck.message}</p>
+                  ) : null}
+                  {preflight.recoveryRequired ? (
+                    <button type="button" className="btn btn-outline preflight-card__button" onClick={recoverNetwork} disabled={isRecovering}>
+                      {isRecovering ? "修复中..." : "修复网络状态"}
+                    </button>
+                  ) : null}
+                </section>
+              ) : null}
+
               <TrafficCard
                 accent="company"
                 title="公司流量"
@@ -1009,7 +1101,7 @@ export function App() {
           <footer className="action-bar">
             <div className={`action-status action-status--${effectiveNotice.tone}`}>
               <span className="action-status__dot" />
-              <span>{effectiveNotice.text}</span>
+              <span>{preflight?.recoveryRequired ? "检测到未恢复的网络状态，请先修复" : effectiveNotice.text}</span>
             </div>
 
             <div className="action-bar__buttons">
@@ -1025,7 +1117,7 @@ export function App() {
                 type="button"
                 className={`btn ${runtimeStatus.state === "running" ? "btn-danger" : "btn-primary"}`}
                 onClick={runtimeStatus.state === "running" ? stopRuntime : startRuntime}
-                disabled={isStarting || isStopping || isBootstrapping}
+                disabled={isStarting || isStopping || isBootstrapping || isRecovering}
               >
                 <Icon name={runtimeStatus.state === "running" ? "stop" : "play"} className="button-icon" />
                 {runtimeStatus.state === "running"
@@ -1036,6 +1128,7 @@ export function App() {
                     ? "启动中..."
                     : "启动隔离"}
               </button>
+              {preflightModeHint ? <span className="action-bar__hint">{preflightModeHint}</span> : null}
               <button type="button" className="btn btn-outline" onClick={saveConfig} disabled={isSaving}>
                 <Icon name="save" className="button-icon" />
                 {isSaving ? "保存中..." : "保存配置"}
