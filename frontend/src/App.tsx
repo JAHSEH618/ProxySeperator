@@ -476,18 +476,22 @@ function normalizeHealthStatus(value: unknown): HealthStatus | null {
   };
 }
 
-function normalizeRuntimeStatus(value: unknown): RuntimeStatus {
+function normalizeRuntimeStatus(value: unknown): RuntimeStatus | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { state: "idle", mode: "system", uptimeSeconds: 0 };
+    return null;
   }
 
   const raw = value as RawRuntimeStatus;
+  const state = pickString(raw.state, raw.State).trim().toLowerCase();
+  if (!state || !["idle", "starting", "running", "stopping", "error"].includes(state)) {
+    return null;
+  }
   const startedAt = pickString(raw.startedAt, raw.StartedAt).trim();
   const lastErrorCode = pickString(raw.lastErrorCode, raw.LastErrorCode).trim();
   const lastErrorMessage = pickString(raw.lastErrorMessage, raw.LastErrorMessage).trim();
 
   return {
-    state: pickString(raw.state, raw.State).trim() || "idle",
+    state,
     mode: pickString(raw.mode, raw.Mode).trim() || "system",
     requestedMode: pickString(raw.requestedMode, raw.RequestedMode).trim() || undefined,
     modeReason: pickString(raw.modeReason, raw.ModeReason).trim() || undefined,
@@ -692,18 +696,31 @@ export function App() {
   const [isRecovering, setIsRecovering] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
   const [isTestingRoute, setIsTestingRoute] = useState(false);
-  const [uiRuntimeActive, setUiRuntimeActive] = useState(false);
   const logSectionRef = useRef<HTMLDivElement | null>(null);
+  const runtimeSyncGenerationRef = useRef(0);
+
+  function bumpRuntimeSyncGeneration() {
+    runtimeSyncGenerationRef.current += 1;
+    return runtimeSyncGenerationRef.current;
+  }
+
+  function commitRuntimeStatus(payload: unknown) {
+    const normalized = normalizeRuntimeStatus(payload);
+    if (!normalized) {
+      return null;
+    }
+    setRuntimeStatus(normalized);
+    return normalized;
+  }
 
   useEffect(() => {
     const applyHealthStatus = (payload: unknown) => {
       setHealth(normalizeHealthStatus(payload));
     };
 
-    const applyRuntimeStatus = (payload: unknown) => {
-      const normalized = normalizeRuntimeStatus(payload);
-      setRuntimeStatus(normalized);
-      setUiRuntimeActive(normalized.state === "running" || normalized.state === "starting");
+    const handleRuntimeStatus = (payload: unknown) => {
+      bumpRuntimeSyncGeneration();
+      commitRuntimeStatus(payload);
     };
 
     const appendLogEntry = (entry: unknown) => {
@@ -715,7 +732,7 @@ export function App() {
     };
 
     const disposers = [
-      runtimeEvents.onRuntimeStatus(applyRuntimeStatus),
+      runtimeEvents.onRuntimeStatus(handleRuntimeStatus),
       runtimeEvents.onRuntimeHealth(applyHealthStatus),
       runtimeEvents.onRuntimeTraffic(setTraffic),
       runtimeEvents.onRuntimeLog(appendLogEntry),
@@ -738,11 +755,10 @@ export function App() {
     const timer = window.setInterval(() => {
       void (async () => {
         try {
+          const generation = bumpRuntimeSyncGeneration();
           const nextRuntimeStatus = await backend.getRuntimeStatus();
-          if (!cancelled) {
-            const normalized = normalizeRuntimeStatus(nextRuntimeStatus);
-            setRuntimeStatus(normalized);
-            setUiRuntimeActive(normalized.state === "running" || normalized.state === "starting");
+          if (!cancelled && generation === runtimeSyncGenerationRef.current) {
+            commitRuntimeStatus(nextRuntimeStatus);
           }
         } catch {
           // Ignore transient polling failures; explicit actions will surface errors.
@@ -758,6 +774,7 @@ export function App() {
 
   async function bootstrap() {
     setIsBootstrapping(true);
+    const generation = bumpRuntimeSyncGeneration();
     try {
       const loadedConfig = normalizeConfig(await backend.loadConfig());
       const [nextRuntimeStatus, nextHealth, nextTraffic, nextLogs, nextPreflight] = await Promise.all([
@@ -767,12 +784,13 @@ export function App() {
         backend.listLogs(20),
         backend.runPreflight(),
       ]);
-      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
+      if (generation !== runtimeSyncGenerationRef.current) {
+        return;
+      }
+      commitRuntimeStatus(nextRuntimeStatus);
 
       setConfig(loadedConfig);
       setSavedConfigKey(serializeConfig(loadedConfig));
-      setRuntimeStatus(normalizedRuntimeStatus);
-      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
       setHealth(normalizeHealthStatus(nextHealth));
       setTraffic(nextTraffic);
       setLogs(normalizeLogEntries(nextLogs));
@@ -834,6 +852,7 @@ export function App() {
 
   async function startRuntime() {
     setIsStarting(true);
+    bumpRuntimeSyncGeneration();
     try {
       if (isDirty) {
         const saved = await persistConfig({ silent: true });
@@ -849,18 +868,18 @@ export function App() {
         });
         return;
       }
-      const startedStatus = normalizeRuntimeStatus(await backend.start());
-      setRuntimeStatus(startedStatus);
-      setUiRuntimeActive(true);
+      commitRuntimeStatus(await backend.start());
+      const generation = bumpRuntimeSyncGeneration();
       const [nextRuntimeStatus, nextHealth, nextTraffic, nextPreflight] = await Promise.all([
         backend.getRuntimeStatus(),
         backend.getHealthStatus(),
         backend.getTrafficStats(),
         backend.runPreflight(),
       ]);
-      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
-      setRuntimeStatus(normalizedRuntimeStatus);
-      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
+      if (generation !== runtimeSyncGenerationRef.current) {
+        return;
+      }
+      commitRuntimeStatus(nextRuntimeStatus);
       setHealth(nextHealth);
       setTraffic(nextTraffic);
       setPreflight(nextPreflight);
@@ -874,15 +893,18 @@ export function App() {
 
   async function stopRuntime() {
     setIsStopping(true);
+    bumpRuntimeSyncGeneration();
     try {
       await backend.stop();
+      const generation = bumpRuntimeSyncGeneration();
       const [nextRuntimeStatus, nextPreflight] = await Promise.all([
         backend.getRuntimeStatus(),
         backend.runPreflight(),
       ]);
-      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
-      setRuntimeStatus(normalizedRuntimeStatus);
-      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
+      if (generation !== runtimeSyncGenerationRef.current) {
+        return;
+      }
+      commitRuntimeStatus(nextRuntimeStatus);
       setPreflight(nextPreflight);
       setNotice({ tone: "info", text: "代理隔离已停止" });
     } catch (error) {
@@ -946,17 +968,20 @@ export function App() {
 
   async function recoverNetwork() {
     setIsRecovering(true);
+    bumpRuntimeSyncGeneration();
     try {
       await backend.recoverNetwork();
+      const generation = bumpRuntimeSyncGeneration();
       const [nextRuntimeStatus, nextHealth, nextTraffic, nextPreflight] = await Promise.all([
         backend.getRuntimeStatus(),
         backend.getHealthStatus(),
         backend.getTrafficStats(),
         backend.runPreflight(),
       ]);
-      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
-      setRuntimeStatus(normalizedRuntimeStatus);
-      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
+      if (generation !== runtimeSyncGenerationRef.current) {
+        return;
+      }
+      commitRuntimeStatus(nextRuntimeStatus);
       setHealth(nextHealth);
       setTraffic(nextTraffic);
       setPreflight(nextPreflight);
@@ -1020,9 +1045,17 @@ export function App() {
   const isBusy = isBootstrapping || isSaving || isStarting || isStopping || isValidating;
   const isDirty = serializeConfig(config) !== savedConfigKey;
   const configuredMode = config.advanced.personalTUNMode ? "system" : config.advanced.tunEnabled ? "tun" : config.advanced.mode || "system";
-  const runtimeActive = runtimeStatus.state === "running" || runtimeStatus.state === "starting";
-  const displayRuntimeActive = runtimeActive || uiRuntimeActive;
-  const runtimeTransitioning = runtimeStatus.state === "starting" || runtimeStatus.state === "stopping";
+  const displayRuntimeActive = isStopping || runtimeStatus.state === "running" || runtimeStatus.state === "stopping";
+  const runtimeTransitioning =
+    isStarting || isStopping || runtimeStatus.state === "starting" || runtimeStatus.state === "stopping";
+  const runtimeActionLabel =
+    isStopping || runtimeStatus.state === "stopping"
+      ? "关闭中..."
+      : displayRuntimeActive
+        ? "关闭隔离"
+        : isStarting || runtimeStatus.state === "starting"
+          ? "启动中..."
+          : "启动隔离";
   const visibleMode = displayRuntimeActive ? runtimeStatus.mode || configuredMode : configuredMode;
   const rulesKey = config.rules.join("\n");
   const activeValidation = validatedRulesKey === rulesKey ? validation : null;
@@ -1400,13 +1433,7 @@ export function App() {
                 disabled={runtimeTransitioning || isBootstrapping || isRecovering}
               >
                 <Icon name={displayRuntimeActive ? "stop" : "play"} className="button-icon" />
-                {displayRuntimeActive
-                  ? isStopping
-                    ? "停止中..."
-                    : "停止隔离"
-                  : isStarting
-                    ? "启动中..."
-                    : "启动隔离"}
+                {runtimeActionLabel}
               </button>
               {preflightModeHint ? <span className="action-bar__hint">{preflightModeHint}</span> : null}
               <button type="button" className="btn btn-outline" onClick={saveConfig} disabled={isSaving}>
