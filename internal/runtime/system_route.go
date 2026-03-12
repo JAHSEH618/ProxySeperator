@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"time"
 )
@@ -38,4 +39,19 @@ func dialSystemRoute(ctx context.Context, network, addr string) (net.Conn, error
 	}
 
 	return nil, lastErr
+}
+
+func dialSystemRouteCandidates(ctx context.Context, network string, candidates []string) (net.Conn, error) {
+	var lastErr error
+	for _, candidate := range candidates {
+		conn, err := systemRouteDialContext(ctx, network, candidate)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no system-route candidates available")
 }

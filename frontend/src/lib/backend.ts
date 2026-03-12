@@ -55,7 +55,7 @@ function getRuntime(): LoadedRuntime {
 }
 
 async function call<T>(method: string, ...args: unknown[]): Promise<T> {
-  return (await getRuntime().Call.ByName(`${SERVICE}.${method}`, ...args)) as T;
+  return unwrapEventData(await getRuntime().Call.ByName(`${SERVICE}.${method}`, ...args)) as T;
 }
 
 export const backend = {

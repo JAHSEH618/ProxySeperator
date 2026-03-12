@@ -7,6 +7,7 @@ export type UpstreamConfig = {
 export type AdvancedConfig = {
   mode: string;
   tunEnabled: boolean;
+  personalTUNMode: boolean;
   udpForwarding: boolean;
   bypassChinaIP: boolean;
   autoStart: boolean;

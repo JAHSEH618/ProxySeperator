@@ -25,6 +25,18 @@ func (u *unsupportedController) ClearSystemProxy(context.Context) error {
 	return nil
 }
 
+func (u *unsupportedController) PreferredCompanyBypassInterface(context.Context) (string, error) {
+	return "", api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持公司旁路接口检测")
+}
+
+func (u *unsupportedController) ApplyCompanyBypassRoutes(context.Context, string, []string) error {
+	return api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持公司旁路路由")
+}
+
+func (u *unsupportedController) ClearCompanyBypassRoutes(context.Context, string, []string) error {
+	return nil
+}
+
 func (u *unsupportedController) EnableAutoStart(context.Context, string) error {
 	return api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持开机自启")
 }

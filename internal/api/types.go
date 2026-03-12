@@ -64,12 +64,13 @@ func (u UpstreamConfig) Address() string {
 }
 
 type AdvancedConfig struct {
-	Mode           string `json:"mode"`
-	TUNEnabled     bool   `json:"tunEnabled"`
-	UDPForwarding  bool   `json:"udpForwarding"`
-	BypassChinaIP  bool   `json:"bypassChinaIP"`
-	AutoStart      bool   `json:"autoStart"`
-	StartMinimized bool   `json:"startMinimized"`
+	Mode            string `json:"mode"`
+	TUNEnabled      bool   `json:"tunEnabled"`
+	PersonalTUNMode bool   `json:"personalTUNMode"`
+	UDPForwarding   bool   `json:"udpForwarding"`
+	BypassChinaIP   bool   `json:"bypassChinaIP"`
+	AutoStart       bool   `json:"autoStart"`
+	StartMinimized  bool   `json:"startMinimized"`
 }
 
 type UIConfig struct {
@@ -107,12 +108,13 @@ func DefaultConfig() Config {
 			"192.168.0.0/16",
 		},
 		Advanced: AdvancedConfig{
-			Mode:           ModeSystem,
-			TUNEnabled:     false,
-			UDPForwarding:  false,
-			BypassChinaIP:  false,
-			AutoStart:      false,
-			StartMinimized: false,
+			Mode:            ModeSystem,
+			TUNEnabled:      false,
+			PersonalTUNMode: false,
+			UDPForwarding:   false,
+			BypassChinaIP:   false,
+			AutoStart:       false,
+			StartMinimized:  false,
 		},
 		UI: UIConfig{
 			Language: "zh-CN",
@@ -204,14 +206,20 @@ type TUNRecoveryState struct {
 	DNSListen       string   `json:"dnsListen,omitempty"`
 }
 
+type CompanyBypassState struct {
+	Interface string   `json:"interface,omitempty"`
+	Routes    []string `json:"routes,omitempty"`
+}
+
 type RecoverySnapshot struct {
-	Platform        string           `json:"platform"`
-	Mode            string           `json:"mode"`
-	WrittenAt       time.Time        `json:"writtenAt"`
-	SystemProxy     SystemProxyState `json:"systemProxy"`
-	SystemProxyData json.RawMessage  `json:"systemProxyData,omitempty"`
-	DNSState        json.RawMessage  `json:"dnsState,omitempty"`
-	TUNState        TUNRecoveryState `json:"tunState,omitempty"`
+	Platform        string             `json:"platform"`
+	Mode            string             `json:"mode"`
+	WrittenAt       time.Time          `json:"writtenAt"`
+	SystemProxy     SystemProxyState   `json:"systemProxy"`
+	SystemProxyData json.RawMessage    `json:"systemProxyData,omitempty"`
+	DNSState        json.RawMessage    `json:"dnsState,omitempty"`
+	TUNState        TUNRecoveryState   `json:"tunState,omitempty"`
+	CompanyBypass   CompanyBypassState `json:"companyBypass,omitempty"`
 }
 
 type InvalidRule struct {

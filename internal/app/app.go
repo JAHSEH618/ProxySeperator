@@ -38,7 +38,8 @@ type BackendAPI struct {
 	emitter *dynamicEmitter
 	manager *runtimeapp.Manager
 
-	cfg api.Config
+	cfg             api.Config
+	onWindowRestore func()
 }
 
 func NewBackendAPI() *BackendAPI {
@@ -83,6 +84,19 @@ func (b *BackendAPI) BindEvents(fn func(string, any)) {
 	b.emitter.SetEmit(fn)
 }
 
+// OnWindowRestore registers a callback invoked after privileged operations
+// (Start, Stop, RecoverNetwork) complete. Use this to bring the application
+// window back to the foreground after macOS authorization dialogs steal focus.
+func (b *BackendAPI) OnWindowRestore(fn func()) {
+	b.onWindowRestore = fn
+}
+
+func (b *BackendAPI) restoreWindow() {
+	if b.onWindowRestore != nil {
+		b.onWindowRestore()
+	}
+}
+
 func (b *BackendAPI) LoadConfig(context.Context) (api.Config, error) {
 	cfg, err := b.store.Load()
 	if err != nil {
@@ -120,7 +134,9 @@ func (b *BackendAPI) RunPreflight(context.Context) (api.PreflightReport, error) 
 
 func (b *BackendAPI) RecoverNetwork(context.Context) error {
 	b.logger.Info("runtime", "收到恢复网络请求", nil)
-	if err := b.manager.RecoverNetwork(); err != nil {
+	err := b.manager.RecoverNetwork()
+	defer b.restoreWindow()
+	if err != nil {
 		b.logger.Error("runtime", "恢复网络失败", map[string]any{"error": err.Error()})
 		return err
 	}
@@ -155,6 +171,7 @@ func (b *BackendAPI) Start(ctx context.Context) (api.RuntimeStatus, error) {
 	}
 	b.logger.Info("runtime", "收到启动请求", map[string]any{"requestedMode": configuredMode(cfg)})
 	status, err := b.manager.Start(cfg)
+	defer b.restoreWindow()
 	if err != nil {
 		b.logger.Error("runtime", "启动失败", map[string]any{"error": err.Error()})
 		return api.RuntimeStatus{}, err
@@ -165,7 +182,9 @@ func (b *BackendAPI) Start(ctx context.Context) (api.RuntimeStatus, error) {
 
 func (b *BackendAPI) Stop(context.Context) error {
 	b.logger.Info("runtime", "收到停止请求", nil)
-	if err := b.manager.Stop(); err != nil {
+	err := b.manager.Stop()
+	defer b.restoreWindow()
+	if err != nil {
 		b.logger.Error("runtime", "停止失败", map[string]any{"error": err.Error()})
 		return err
 	}
@@ -181,6 +200,7 @@ func (b *BackendAPI) Restart(ctx context.Context) (api.RuntimeStatus, error) {
 	}
 	b.logger.Info("runtime", "收到重启请求", map[string]any{"requestedMode": configuredMode(cfg)})
 	status, err := b.manager.Restart(cfg)
+	defer b.restoreWindow()
 	if err != nil {
 		b.logger.Error("runtime", "重启失败", map[string]any{"error": err.Error()})
 		return api.RuntimeStatus{}, err
@@ -318,6 +338,9 @@ func validateConfig(cfg api.Config) error {
 }
 
 func configuredMode(cfg api.Config) string {
+	if cfg.Advanced.PersonalTUNMode {
+		return api.ModeSystem
+	}
 	if cfg.Advanced.TUNEnabled || cfg.Advanced.Mode == api.ModeTUN {
 		return api.ModeTUN
 	}

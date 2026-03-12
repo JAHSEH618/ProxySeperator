@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +46,10 @@ type Manager struct {
 	status api.RuntimeStatus
 	cfg    api.Config
 	cancel context.CancelFunc
+
+	companyBypassInterface string
+	companyBypassRoutes    []string
+	companyDomainDialer    *companyDomainDialer
 }
 
 type Options struct {
@@ -226,6 +232,9 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		RequestedMode: report.RequestedMode,
 		ModeReason:    report.ModeReason,
 	}
+	m.companyBypassInterface = ""
+	m.companyBypassRoutes = nil
+	m.companyDomainDialer = nil
 	m.emitStatus()
 
 	matcher := rules.NewMatcher(rules.ParseLines(m.cfg.Rules).Compiled)
@@ -310,6 +319,63 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			_ = m.journal.Save(snapshot)
 		}
 	} else {
+		if m.cfg.Advanced.PersonalTUNMode {
+			bypassRoutes := companyBypassCIDRs(m.cfg)
+			if len(bypassRoutes) > 0 {
+				iface, err := m.platform.PreferredCompanyBypassInterface(runCtx)
+				if err != nil {
+					m.rollbackLocked(runCtx, false)
+					wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "无法识别公司旁路接口", err)
+					m.status.LastErrorCode = wrapped.Code
+					m.status.LastErrorMessage = wrapped.Error()
+					m.emitStatus()
+					return m.status, wrapped
+				}
+				if err := m.platform.ApplyCompanyBypassRoutes(runCtx, iface, bypassRoutes); err != nil {
+					m.rollbackLocked(runCtx, false)
+					m.status.LastErrorCode = api.ErrorCode(err)
+					m.status.LastErrorMessage = err.Error()
+					m.emitStatus()
+					return m.status, err
+				}
+				m.companyBypassInterface = iface
+				m.companyBypassRoutes = append([]string(nil), bypassRoutes...)
+				snapshot.CompanyBypass = api.CompanyBypassState{
+					Interface: iface,
+					Routes:    append([]string(nil), bypassRoutes...),
+				}
+				snapshot.WrittenAt = time.Now()
+				_ = m.journal.Save(snapshot)
+			}
+			resolvers := []string(nil)
+			if currentResolvers, err := m.platform.CurrentDNSResolvers(runCtx); err == nil {
+				resolvers = append(resolvers, currentResolvers...)
+			} else {
+				m.logger.Warn("runtime", "读取当前 DNS 解析器失败，将仅使用本地回环解析器做公司域名解析", map[string]any{"error": err.Error()})
+			}
+			m.companyDomainDialer = newCompanyDomainDialer(
+				m.logger,
+				m.platform,
+				m.companyBypassInterface,
+				resolvers,
+				func(dynamicRoutes []string) {
+					if !m.journal.Exists() {
+						return
+					}
+					snapshot, err := m.journal.Load()
+					if err != nil {
+						return
+					}
+					snapshot.CompanyBypass = api.CompanyBypassState{
+						Interface: m.companyBypassInterface,
+						Routes:    mergeRouteLists(m.companyBypassRoutes, dynamicRoutes),
+					}
+					snapshot.WrittenAt = time.Now()
+					_ = m.journal.Save(snapshot)
+				},
+			)
+			m.forwarder.SetCompanyDialPreparer(m.companyDomainDialer)
+		}
 		if err := m.platform.ApplySystemProxy(runCtx, m.systemProxyConfig()); err != nil {
 			m.rollbackLocked(runCtx, false)
 			m.status.LastErrorCode = api.ErrorCode(err)
@@ -426,6 +492,9 @@ func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (boo
 		m.status.RecoveryRequired = false
 		m.status.LastErrorCode = ""
 		m.status.LastErrorMessage = ""
+		m.companyBypassInterface = ""
+		m.companyBypassRoutes = nil
+		m.companyDomainDialer = nil
 		m.emitStatus()
 		return false, nil
 	}
@@ -461,6 +530,9 @@ func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (boo
 		Mode:          mode,
 		RequestedMode: mode,
 	}
+	m.companyBypassInterface = ""
+	m.companyBypassRoutes = nil
+	m.companyDomainDialer = nil
 	m.emitStatus()
 	return true, nil
 }
@@ -484,6 +556,13 @@ func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {
 		}
 		_ = m.platform.StopTUN(ctx)
 	} else {
+		routes := append([]string(nil), m.companyBypassRoutes...)
+		if m.companyDomainDialer != nil {
+			routes = mergeRouteLists(routes, m.companyDomainDialer.DynamicRoutes())
+		}
+		if m.companyBypassInterface != "" && len(routes) > 0 {
+			_ = m.platform.ClearCompanyBypassRoutes(ctx, m.companyBypassInterface, routes)
+		}
 		_ = m.platform.ClearSystemProxy(ctx)
 	}
 	m.dns = nil
@@ -501,14 +580,19 @@ func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {
 		RequestedMode:    requested,
 		RecoveryRequired: recoveryRequired,
 	}
+	m.companyBypassInterface = ""
+	m.companyBypassRoutes = nil
+	m.companyDomainDialer = nil
 	m.emitStatus()
 }
 
 func (m *Manager) backgroundLoop(ctx context.Context) {
 	healthTicker := time.NewTicker(5 * time.Second)
 	trafficTicker := time.NewTicker(1 * time.Second)
+	companyTicker := time.NewTicker(15 * time.Second)
 	defer healthTicker.Stop()
 	defer trafficTicker.Stop()
+	defer companyTicker.Stop()
 
 	for {
 		select {
@@ -520,6 +604,13 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			m.health = health
 			m.mu.Unlock()
 			m.emitHealth()
+		case <-companyTicker.C:
+			m.mu.Lock()
+			companyDialer := m.companyDomainDialer
+			m.mu.Unlock()
+			if companyDialer != nil {
+				companyDialer.Refresh(ctx)
+			}
 		case <-trafficTicker.C:
 			m.emitTraffic()
 			m.emitStatus()
@@ -549,4 +640,24 @@ func (m *Manager) systemProxyConfig() platform.SystemProxyConfig {
 		HTTPSAddress: m.httpListenAddr,
 		SOCKSAddress: m.socksListenAddr,
 	}
+}
+
+func mergeRouteLists(routeSets ...[]string) []string {
+	seen := map[string]struct{}{}
+	merged := make([]string, 0)
+	for _, routes := range routeSets {
+		for _, route := range routes {
+			route = strings.TrimSpace(route)
+			if route == "" {
+				continue
+			}
+			if _, ok := seen[route]; ok {
+				continue
+			}
+			seen[route] = struct{}{}
+			merged = append(merged, route)
+		}
+	}
+	sort.Strings(merged)
+	return merged
 }

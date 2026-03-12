@@ -29,10 +29,11 @@ const defaultConfig: Config = {
   version: 1,
   companyUpstream: { host: "system-route", port: 0, protocol: "direct" },
   personalUpstream: { host: "127.0.0.1", port: 7897, protocol: "auto" },
-  rules: [".company.com", ".internal", "10.0.0.0/8"],
+  rules: [".company.com", ".internal", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
   advanced: {
     mode: "system",
     tunEnabled: false,
+    personalTUNMode: false,
     udpForwarding: false,
     bypassChinaIP: false,
     autoStart: false,
@@ -76,6 +77,18 @@ type RawHealthStatus = Partial<HealthStatus> & {
   CheckedAt?: string;
   Company?: RawUpstreamHealth;
   Personal?: RawUpstreamHealth;
+};
+
+type RawRuntimeStatus = Partial<RuntimeStatus> & {
+  State?: string;
+  Mode?: string;
+  RequestedMode?: string;
+  ModeReason?: string;
+  RecoveryRequired?: boolean;
+  StartedAt?: string;
+  UptimeSeconds?: number;
+  LastErrorCode?: string;
+  LastErrorMessage?: string;
 };
 
 type IconName =
@@ -320,6 +333,42 @@ function formatPreflightMode(value?: string) {
   return value === "tun" ? "TUN 共存模式" : "系统代理模式";
 }
 
+function ensureBypassCIDRs(lines: string[]) {
+  const required = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+  const existing = new Set(lines.map((line) => line.trim().toLowerCase()).filter(Boolean));
+  const next = [...lines];
+  for (const cidr of required) {
+    if (!existing.has(cidr.toLowerCase())) {
+      next.push(cidr);
+    }
+  }
+  return next;
+}
+
+function normalizeConfig(value: Config): Config {
+  return {
+    ...defaultConfig,
+    ...value,
+    companyUpstream: {
+      ...defaultConfig.companyUpstream,
+      ...value.companyUpstream,
+    },
+    personalUpstream: {
+      ...defaultConfig.personalUpstream,
+      ...value.personalUpstream,
+    },
+    advanced: {
+      ...defaultConfig.advanced,
+      ...value.advanced,
+    },
+    ui: {
+      ...defaultConfig.ui,
+      ...value.ui,
+    },
+    rules: Array.isArray(value.rules) ? value.rules : defaultConfig.rules,
+  };
+}
+
 function pickString(...values: unknown[]) {
   for (const value of values) {
     if (typeof value === "string") {
@@ -424,6 +473,29 @@ function normalizeHealthStatus(value: unknown): HealthStatus | null {
     checkedAt: checkedAt || undefined,
     company: normalizeUpstreamHealth(raw.company ?? raw.Company),
     personal: normalizeUpstreamHealth(raw.personal ?? raw.Personal),
+  };
+}
+
+function normalizeRuntimeStatus(value: unknown): RuntimeStatus {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { state: "idle", mode: "system", uptimeSeconds: 0 };
+  }
+
+  const raw = value as RawRuntimeStatus;
+  const startedAt = pickString(raw.startedAt, raw.StartedAt).trim();
+  const lastErrorCode = pickString(raw.lastErrorCode, raw.LastErrorCode).trim();
+  const lastErrorMessage = pickString(raw.lastErrorMessage, raw.LastErrorMessage).trim();
+
+  return {
+    state: pickString(raw.state, raw.State).trim() || "idle",
+    mode: pickString(raw.mode, raw.Mode).trim() || "system",
+    requestedMode: pickString(raw.requestedMode, raw.RequestedMode).trim() || undefined,
+    modeReason: pickString(raw.modeReason, raw.ModeReason).trim() || undefined,
+    recoveryRequired: pickBoolean(raw.recoveryRequired, raw.RecoveryRequired),
+    startedAt: startedAt || undefined,
+    uptimeSeconds: pickNumber(raw.uptimeSeconds, raw.UptimeSeconds),
+    lastErrorCode: lastErrorCode || undefined,
+    lastErrorMessage: lastErrorMessage || undefined,
   };
 }
 
@@ -620,11 +692,18 @@ export function App() {
   const [isRecovering, setIsRecovering] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
   const [isTestingRoute, setIsTestingRoute] = useState(false);
+  const [uiRuntimeActive, setUiRuntimeActive] = useState(false);
   const logSectionRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const applyHealthStatus = (payload: unknown) => {
       setHealth(normalizeHealthStatus(payload));
+    };
+
+    const applyRuntimeStatus = (payload: unknown) => {
+      const normalized = normalizeRuntimeStatus(payload);
+      setRuntimeStatus(normalized);
+      setUiRuntimeActive(normalized.state === "running" || normalized.state === "starting");
     };
 
     const appendLogEntry = (entry: unknown) => {
@@ -636,7 +715,7 @@ export function App() {
     };
 
     const disposers = [
-      runtimeEvents.onRuntimeStatus(setRuntimeStatus),
+      runtimeEvents.onRuntimeStatus(applyRuntimeStatus),
       runtimeEvents.onRuntimeHealth(applyHealthStatus),
       runtimeEvents.onRuntimeTraffic(setTraffic),
       runtimeEvents.onRuntimeLog(appendLogEntry),
@@ -654,10 +733,33 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const nextRuntimeStatus = await backend.getRuntimeStatus();
+          if (!cancelled) {
+            const normalized = normalizeRuntimeStatus(nextRuntimeStatus);
+            setRuntimeStatus(normalized);
+            setUiRuntimeActive(normalized.state === "running" || normalized.state === "starting");
+          }
+        } catch {
+          // Ignore transient polling failures; explicit actions will surface errors.
+        }
+      })();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   async function bootstrap() {
     setIsBootstrapping(true);
     try {
-      const loadedConfig = await backend.loadConfig();
+      const loadedConfig = normalizeConfig(await backend.loadConfig());
       const [nextRuntimeStatus, nextHealth, nextTraffic, nextLogs, nextPreflight] = await Promise.all([
         backend.getRuntimeStatus(),
         backend.getHealthStatus(),
@@ -665,10 +767,12 @@ export function App() {
         backend.listLogs(20),
         backend.runPreflight(),
       ]);
+      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
 
       setConfig(loadedConfig);
       setSavedConfigKey(serializeConfig(loadedConfig));
-      setRuntimeStatus(nextRuntimeStatus);
+      setRuntimeStatus(normalizedRuntimeStatus);
+      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
       setHealth(normalizeHealthStatus(nextHealth));
       setTraffic(nextTraffic);
       setLogs(normalizeLogEntries(nextLogs));
@@ -745,13 +849,18 @@ export function App() {
         });
         return;
       }
-      const status = await backend.start();
-      const [nextHealth, nextTraffic, nextPreflight] = await Promise.all([
+      const startedStatus = normalizeRuntimeStatus(await backend.start());
+      setRuntimeStatus(startedStatus);
+      setUiRuntimeActive(true);
+      const [nextRuntimeStatus, nextHealth, nextTraffic, nextPreflight] = await Promise.all([
+        backend.getRuntimeStatus(),
         backend.getHealthStatus(),
         backend.getTrafficStats(),
         backend.runPreflight(),
       ]);
-      setRuntimeStatus(status);
+      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
+      setRuntimeStatus(normalizedRuntimeStatus);
+      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
       setHealth(nextHealth);
       setTraffic(nextTraffic);
       setPreflight(nextPreflight);
@@ -771,7 +880,9 @@ export function App() {
         backend.getRuntimeStatus(),
         backend.runPreflight(),
       ]);
-      setRuntimeStatus(nextRuntimeStatus);
+      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
+      setRuntimeStatus(normalizedRuntimeStatus);
+      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
       setPreflight(nextPreflight);
       setNotice({ tone: "info", text: "代理隔离已停止" });
     } catch (error) {
@@ -843,7 +954,9 @@ export function App() {
         backend.getTrafficStats(),
         backend.runPreflight(),
       ]);
-      setRuntimeStatus(nextRuntimeStatus);
+      const normalizedRuntimeStatus = normalizeRuntimeStatus(nextRuntimeStatus);
+      setRuntimeStatus(normalizedRuntimeStatus);
+      setUiRuntimeActive(normalizedRuntimeStatus.state === "running" || normalizedRuntimeStatus.state === "starting");
       setHealth(nextHealth);
       setTraffic(nextTraffic);
       setPreflight(nextPreflight);
@@ -906,8 +1019,11 @@ export function App() {
 
   const isBusy = isBootstrapping || isSaving || isStarting || isStopping || isValidating;
   const isDirty = serializeConfig(config) !== savedConfigKey;
-  const configuredMode = config.advanced.tunEnabled ? "tun" : config.advanced.mode || "system";
-  const visibleMode = runtimeStatus.state === "running" || runtimeStatus.state === "starting" ? runtimeStatus.mode : configuredMode;
+  const configuredMode = config.advanced.personalTUNMode ? "system" : config.advanced.tunEnabled ? "tun" : config.advanced.mode || "system";
+  const runtimeActive = runtimeStatus.state === "running" || runtimeStatus.state === "starting";
+  const displayRuntimeActive = runtimeActive || uiRuntimeActive;
+  const runtimeTransitioning = runtimeStatus.state === "starting" || runtimeStatus.state === "stopping";
+  const visibleMode = displayRuntimeActive ? runtimeStatus.mode || configuredMode : configuredMode;
   const rulesKey = config.rules.join("\n");
   const activeValidation = validatedRulesKey === rulesKey ? validation : null;
   const ruleSummary = activeValidation
@@ -1204,8 +1320,9 @@ export function App() {
               <div className="advanced-grid">
                 <SettingCard
                   title="启用 TUN 模式"
-                  description="适用于不走系统代理的应用"
+                  description={config.advanced.personalTUNMode ? "个人代理长期 TUN 开启时，不再使用应用内 TUN" : "适用于不走系统代理的应用"}
                   checked={config.advanced.tunEnabled}
+                  disabled={config.advanced.personalTUNMode}
                   onToggle={() => {
                     const nextValue = !config.advanced.tunEnabled;
                     setConfig({
@@ -1215,6 +1332,25 @@ export function App() {
                         tunEnabled: nextValue,
                         mode: nextValue ? "tun" : "system",
                         udpForwarding: nextValue ? config.advanced.udpForwarding : false,
+                      },
+                    });
+                  }}
+                />
+                <SettingCard
+                  title="个人代理长期 TUN"
+                  description="适用于 Clash / sing-box 等长期启用 TUN 的个人代理环境"
+                  checked={config.advanced.personalTUNMode}
+                  onToggle={() => {
+                    const nextValue = !config.advanced.personalTUNMode;
+                    setConfig({
+                      ...config,
+                      rules: nextValue ? ensureBypassCIDRs(config.rules) : config.rules,
+                      advanced: {
+                        ...config.advanced,
+                        personalTUNMode: nextValue,
+                        tunEnabled: nextValue ? false : config.advanced.tunEnabled,
+                        mode: nextValue ? "system" : config.advanced.mode,
+                        udpForwarding: nextValue ? false : config.advanced.udpForwarding,
                       },
                     });
                   }}
@@ -1259,12 +1395,12 @@ export function App() {
               </button>
               <button
                 type="button"
-                className={`btn ${runtimeStatus.state === "running" ? "btn-danger" : "btn-primary"}`}
-                onClick={runtimeStatus.state === "running" ? stopRuntime : startRuntime}
-                disabled={isStarting || isStopping || isBootstrapping || isRecovering}
+                className={`btn ${displayRuntimeActive ? "btn-danger" : "btn-primary"}`}
+                onClick={displayRuntimeActive ? stopRuntime : startRuntime}
+                disabled={runtimeTransitioning || isBootstrapping || isRecovering}
               >
-                <Icon name={runtimeStatus.state === "running" ? "stop" : "play"} className="button-icon" />
-                {runtimeStatus.state === "running"
+                <Icon name={displayRuntimeActive ? "stop" : "play"} className="button-icon" />
+                {displayRuntimeActive
                   ? isStopping
                     ? "停止中..."
                     : "停止隔离"

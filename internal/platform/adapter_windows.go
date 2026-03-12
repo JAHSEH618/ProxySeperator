@@ -87,6 +87,42 @@ func (c *windowsController) ClearSystemProxy(_ context.Context) error {
 	return nil
 }
 
+func (c *windowsController) PreferredCompanyBypassInterface(ctx context.Context) (string, error) {
+	return c.DefaultEgressInterface(ctx)
+}
+
+func (c *windowsController) ApplyCompanyBypassRoutes(ctx context.Context, iface string, routes []string) error {
+	if iface == "" || len(routes) == 0 {
+		return nil
+	}
+	for _, prefix := range routes {
+		script := fmt.Sprintf(`
+$existing = Get-NetRoute -InterfaceAlias '%s' -DestinationPrefix '%s' -ErrorAction SilentlyContinue
+if (-not $existing) {
+  New-NetRoute -InterfaceAlias '%s' -DestinationPrefix '%s' -NextHop '0.0.0.0' -RouteMetric 1 | Out-Null
+}
+`, psQuote(iface), prefix, psQuote(iface), prefix)
+		if _, err := runPowerShell(ctx, script); err != nil {
+			return api.WrapError(api.ErrCodeSystemProxyFailed, "安装公司旁路路由失败", err)
+		}
+	}
+	return nil
+}
+
+func (c *windowsController) ClearCompanyBypassRoutes(ctx context.Context, iface string, routes []string) error {
+	if iface == "" || len(routes) == 0 {
+		return nil
+	}
+	var firstErr error
+	for _, prefix := range routes {
+		script := fmt.Sprintf("Remove-NetRoute -InterfaceAlias '%s' -DestinationPrefix '%s' -Confirm:$false -ErrorAction SilentlyContinue", psQuote(iface), prefix)
+		if _, err := runPowerShell(ctx, script); err != nil && firstErr == nil {
+			firstErr = api.WrapError(api.ErrCodeSystemProxyFailed, "清理公司旁路路由失败", err)
+		}
+	}
+	return firstErr
+}
+
 func (c *windowsController) EnableAutoStart(_ context.Context, executablePath string) error {
 	key, _, err := registry.CreateKey(registry.CURRENT_USER, runKeyPath, registry.SET_VALUE)
 	if err != nil {
@@ -216,6 +252,11 @@ func (c *windowsController) RecoverNetwork(ctx context.Context, snapshot api.Rec
 		}
 		if err := c.restoreDNSServers(ctx, states); err != nil {
 			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复系统 DNS 失败", err)
+		}
+	}
+	if snapshot.CompanyBypass.Interface != "" && len(snapshot.CompanyBypass.Routes) > 0 {
+		if err := c.ClearCompanyBypassRoutes(ctx, snapshot.CompanyBypass.Interface, snapshot.CompanyBypass.Routes); err != nil {
+			return api.WrapError(api.ErrCodeRecoveryFailed, "恢复公司旁路路由失败", err)
 		}
 	}
 	if err := c.removeSplitRoutes(ctx, snapshot.TUNState.Interface); err != nil {

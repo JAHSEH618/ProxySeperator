@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -84,10 +83,6 @@ func startTUNHelper(ctx context.Context, logger *logging.Logger, opts tunHelperO
 		args = append(args, "--interface", opts.Interface)
 	}
 
-	if runtime.GOOS == "darwin" {
-		return startPrivilegedTUNHelper(ctx, logger, executable, args)
-	}
-
 	cmd := exec.CommandContext(ctx, executable, args...)
 	cmd.Dir = opts.WorkingDirectory
 
@@ -123,59 +118,6 @@ func startTUNHelper(ctx context.Context, logger *logging.Logger, opts tunHelperO
 	return process, nil
 }
 
-func startPrivilegedTUNHelper(ctx context.Context, logger *logging.Logger, executable string, args []string) (*tunHelperProcess, error) {
-	stdoutFile, err := os.CreateTemp("", "proxyseparator-tun-stdout-*.log")
-	if err != nil {
-		return nil, api.WrapError(api.ErrCodeTUNUnavailable, "无法创建 TUN helper 输出文件", err)
-	}
-	stdoutPath := stdoutFile.Name()
-	_ = stdoutFile.Close()
-
-	stderrFile, err := os.CreateTemp("", "proxyseparator-tun-stderr-*.log")
-	if err != nil {
-		_ = os.Remove(stdoutPath)
-		return nil, api.WrapError(api.ErrCodeTUNUnavailable, "无法创建 TUN helper 错误输出文件", err)
-	}
-	stderrPath := stderrFile.Name()
-	_ = stderrFile.Close()
-
-	commandLine := buildShellCommand(executable, args...)
-	launchCommand := fmt.Sprintf("%s > %s 2> %s & echo $!", commandLine, shellQuote(stdoutPath), shellQuote(stderrPath))
-	output, err := runDarwinPrivilegedShell(ctx, launchCommand)
-	if err != nil {
-		_ = os.Remove(stdoutPath)
-		_ = os.Remove(stderrPath)
-		wrapped := wrapPrivilegedCommandError("未授予 macOS 管理员权限，无法启动 TUN helper", err, output)
-		if api.ErrorCode(wrapped) == api.ErrCodePermissionDenied {
-			return nil, wrapped
-		}
-		return nil, api.WrapError(api.ErrCodeTUNUnavailable, "启动 TUN helper 失败", wrapped)
-	}
-
-	pid, err := strconv.Atoi(strings.TrimSpace(string(output)))
-	if err != nil || pid <= 0 {
-		_ = os.Remove(stdoutPath)
-		_ = os.Remove(stderrPath)
-		return nil, api.WrapError(api.ErrCodeTUNUnavailable, "解析 TUN helper 进程号失败", err)
-	}
-
-	process := &tunHelperProcess{
-		logger:     logger,
-		readyCh:    make(chan string, 1),
-		doneCh:     make(chan struct{}),
-		pid:        pid,
-		privileged: true,
-		stdoutPath: stdoutPath,
-		stderrPath: stderrPath,
-	}
-
-	go process.pumpFile(stdoutPath, "stdout")
-	go process.pumpFile(stderrPath, "stderr")
-	go process.waitPrivilegedExit()
-
-	return process, nil
-}
-
 func (p *tunHelperProcess) WaitReady(timeout time.Duration) (string, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -198,9 +140,18 @@ func (p *tunHelperProcess) Stop(ctx context.Context) error {
 		if p == nil || !p.privileged || p.pid <= 0 {
 			return nil
 		}
-		if !p.isDone() {
-			_ = runDarwinPrivilegedKill(ctx, p.pid, syscall.SIGTERM)
+		if p.isDone() {
+			p.cleanupTempFiles()
+			err := p.waitErrValue()
+			if err == nil || errors.Is(err, os.ErrProcessDone) {
+				return nil
+			}
+			return err
 		}
+		// Single privileged script: SIGTERM, wait, then SIGKILL
+		script := buildPrivilegedKillScript(p.pid)
+		_, _ = runPrivilegedScript(ctx, script)
+
 		select {
 		case <-p.doneCh:
 			p.cleanupTempFiles()
@@ -210,7 +161,6 @@ func (p *tunHelperProcess) Stop(ctx context.Context) error {
 			}
 			return err
 		case <-ctx.Done():
-			_ = runDarwinPrivilegedKill(context.Background(), p.pid, syscall.SIGKILL)
 			<-p.doneCh
 			p.cleanupTempFiles()
 			return ctx.Err()
@@ -424,16 +374,26 @@ func runDarwinPrivilegedShell(ctx context.Context, shellCommand string) ([]byte,
 	return exec.CommandContext(ctx, "osascript", "-e", script).CombinedOutput()
 }
 
-func runDarwinPrivilegedKill(ctx context.Context, pid int, signal syscall.Signal) error {
-	if pid <= 0 {
-		return nil
+// runPrivilegedScript writes scriptContent to a temp file and executes it via
+// a single osascript "with administrator privileges" invocation. This allows
+// batching multiple privileged commands into one password prompt.
+func runPrivilegedScript(ctx context.Context, scriptContent string) ([]byte, error) {
+	tmpFile, err := os.CreateTemp("", "proxyseparator-priv-*.sh")
+	if err != nil {
+		return nil, fmt.Errorf("create temp script: %w", err)
 	}
-	command := fmt.Sprintf("kill -%d %d >/dev/null 2>&1 || true", signal, pid)
-	output, err := runDarwinPrivilegedShell(ctx, command)
-	if err == nil {
-		return nil
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.WriteString(scriptContent); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("write temp script: %w", err)
 	}
-	return wrapCommandError(err, output)
+	tmpFile.Close()
+	_ = os.Chmod(tmpPath, 0700)
+
+	shellCmd := "/bin/bash " + shellQuote(tmpPath)
+	return runDarwinPrivilegedShell(ctx, shellCmd)
 }
 
 func wrapCommandError(err error, output []byte) error {

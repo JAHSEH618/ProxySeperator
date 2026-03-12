@@ -25,6 +25,7 @@ type Forwarder struct {
 
 	mu             sync.RWMutex
 	matcher        *rules.Matcher
+	companyDialer  companyDialPreparer
 	personalConfig api.UpstreamConfig
 	health         api.HealthStatus
 }
@@ -59,6 +60,12 @@ func (f *Forwarder) Health() api.HealthStatus {
 	return f.health
 }
 
+func (f *Forwarder) SetCompanyDialPreparer(preparer companyDialPreparer) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.companyDialer = preparer
+}
+
 func (f *Forwarder) TestRoute(input string) api.RouteTestResult {
 	result := f.matchTarget(input)
 	return api.RouteTestResult{
@@ -79,7 +86,7 @@ func (f *Forwarder) DialTarget(ctx context.Context, network, addr string) (net.C
 	var err error
 	switch target {
 	case api.RouteTargetCompany:
-		conn, err = dialSystemRoute(ctx, network, addr)
+		conn, err = f.dialCompanyTarget(ctx, network, addr)
 	case api.RouteTargetDirect:
 		conn, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
 	default:
@@ -91,6 +98,25 @@ func (f *Forwarder) DialTarget(ctx context.Context, network, addr string) (net.C
 	}
 	f.stats.SessionStarted()
 	return &trackedConn{Conn: conn, target: target, stats: f.stats}, target, nil
+}
+
+func (f *Forwarder) dialCompanyTarget(ctx context.Context, network, addr string) (net.Conn, error) {
+	f.mu.RLock()
+	preparer := f.companyDialer
+	f.mu.RUnlock()
+	if preparer != nil {
+		candidates, err := preparer.PrepareDialTargets(ctx, addr)
+		if err == nil && len(candidates) > 0 {
+			return dialSystemRouteCandidates(ctx, network, candidates)
+		}
+		if err != nil && f.logger != nil {
+			f.logger.Warn("runtime.forwarder", "公司域名动态直连准备失败，回退到系统解析", map[string]any{
+				"target": addr,
+				"error":  err.Error(),
+			})
+		}
+	}
+	return dialSystemRoute(ctx, network, addr)
 }
 
 func (f *Forwarder) matchTarget(input string) rules.MatchResult {

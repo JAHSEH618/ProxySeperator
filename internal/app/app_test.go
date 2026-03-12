@@ -11,8 +11,9 @@ import (
 )
 
 type fakePlatformController struct {
-	applied bool
-	cleared bool
+	applied       bool
+	cleared       bool
+	bypassCleared bool
 }
 
 func (f *fakePlatformController) ApplySystemProxy(context.Context, platform.SystemProxyConfig) error {
@@ -22,6 +23,19 @@ func (f *fakePlatformController) ApplySystemProxy(context.Context, platform.Syst
 
 func (f *fakePlatformController) ClearSystemProxy(context.Context) error {
 	f.cleared = true
+	return nil
+}
+
+func (f *fakePlatformController) PreferredCompanyBypassInterface(context.Context) (string, error) {
+	return "en0", nil
+}
+
+func (f *fakePlatformController) ApplyCompanyBypassRoutes(context.Context, string, []string) error {
+	return nil
+}
+
+func (f *fakePlatformController) ClearCompanyBypassRoutes(context.Context, string, []string) error {
+	f.bypassCleared = true
 	return nil
 }
 

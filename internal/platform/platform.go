@@ -20,6 +20,9 @@ type TUNOptions struct {
 type Controller interface {
 	ApplySystemProxy(ctx context.Context, cfg SystemProxyConfig) error
 	ClearSystemProxy(ctx context.Context) error
+	PreferredCompanyBypassInterface(ctx context.Context) (string, error)
+	ApplyCompanyBypassRoutes(ctx context.Context, iface string, routes []string) error
+	ClearCompanyBypassRoutes(ctx context.Context, iface string, routes []string) error
 	EnableAutoStart(ctx context.Context, executablePath string) error
 	DisableAutoStart(ctx context.Context) error
 	CurrentSystemProxy(ctx context.Context) (api.SystemProxyState, error)

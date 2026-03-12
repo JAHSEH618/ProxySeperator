@@ -15,6 +15,9 @@ import (
 type fakePlatform struct {
 	applied           bool
 	cleared           bool
+	bypassInterface   string
+	bypassRoutes      []string
+	clearedBypass     []string
 	systemProxy       api.SystemProxyState
 	defaultEgress     string
 	validateTUNErr    error
@@ -31,6 +34,24 @@ func (f *fakePlatform) ApplySystemProxy(context.Context, platform.SystemProxyCon
 
 func (f *fakePlatform) ClearSystemProxy(context.Context) error {
 	f.cleared = true
+	return nil
+}
+
+func (f *fakePlatform) PreferredCompanyBypassInterface(context.Context) (string, error) {
+	if f.defaultEgress == "" {
+		return "en0", nil
+	}
+	return f.defaultEgress, nil
+}
+
+func (f *fakePlatform) ApplyCompanyBypassRoutes(_ context.Context, iface string, routes []string) error {
+	f.bypassInterface = iface
+	f.bypassRoutes = append([]string(nil), routes...)
+	return nil
+}
+
+func (f *fakePlatform) ClearCompanyBypassRoutes(_ context.Context, _ string, routes []string) error {
+	f.clearedBypass = append([]string(nil), routes...)
 	return nil
 }
 
@@ -107,6 +128,96 @@ func TestManagerStartStopSystemMode(t *testing.T) {
 	}
 }
 
+func TestManagerStartStopSystemModeWithPersonalTUNAppliesCompanyBypassRoutes(t *testing.T) {
+	companyStub := startSOCKS5Stub(t)
+	personalStub := startSOCKS5Stub(t)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.Advanced.PersonalTUNMode = true
+	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
+	cfg.PersonalUpstream = upstreamFromAddress(t, personalStub)
+
+	status, err := manager.Start(cfg)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	if status.State != api.RuntimeStateRunning {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+	if got, want := controller.bypassInterface, "en0"; got != want {
+		t.Fatalf("expected bypass interface %q, got %q", want, got)
+	}
+	if len(controller.bypassRoutes) == 0 {
+		t.Fatal("expected company bypass routes to be installed")
+	}
+
+	if err := manager.Stop(); err != nil {
+		t.Fatalf("stop failed: %v", err)
+	}
+	if len(controller.clearedBypass) == 0 {
+		t.Fatal("expected company bypass routes to be cleared")
+	}
+}
+
+func TestRunPreflightBlocksPersonalTUNModeWithoutCompanyCIDRRoutes(t *testing.T) {
+	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+	}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:17900",
+		SOCKSListenAddr:     "127.0.0.1:17901",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.Advanced.PersonalTUNMode = true
+	cfg.PersonalUpstream = personalUpstream
+	cfg.Rules = []string{".cmft"}
+
+	report, err := manager.RunPreflight(cfg)
+	if err != nil {
+		t.Fatalf("preflight failed: %v", err)
+	}
+	if report.CanStart {
+		t.Fatalf("expected preflight to fail without CIDR bypass routes, got %+v", report)
+	}
+	found := false
+	for _, check := range report.Checks {
+		if check.ID == checkCompanyBypassRoutes {
+			found = true
+			if check.Status != "fail" {
+				t.Fatalf("expected bypass route check to fail, got %+v", check)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected %s check in report, got %+v", checkCompanyBypassRoutes, report)
+	}
+}
+
 func TestRunPreflightAutoSwitchesToTUNOnSystemProxyConflict(t *testing.T) {
 	companyStub := startSOCKS5Stub(t)
 	personalStub := startSOCKS5Stub(t)
@@ -146,7 +257,7 @@ func TestRunPreflightAutoSwitchesToTUNOnSystemProxyConflict(t *testing.T) {
 	}
 }
 
-func TestRunPreflightUsesTUNWhenPersonalProxyOwnsSystemProxyAndCompanyUsesSystemRoute(t *testing.T) {
+func TestRunPreflightStaysSystemWhenPersonalProxyOwnsSystemProxyAndCompanyUsesSystemRoute(t *testing.T) {
 	personalStub := startSOCKS5Stub(t)
 	personalUpstream := upstreamFromAddress(t, personalStub)
 
@@ -177,14 +288,14 @@ func TestRunPreflightUsesTUNWhenPersonalProxyOwnsSystemProxyAndCompanyUsesSystem
 		t.Fatalf("preflight failed: %v", err)
 	}
 	if !report.CanStart {
-		t.Fatalf("expected preflight to pass with TUN fallback, got %+v", report)
+		t.Fatalf("expected preflight to pass, got %+v", report)
 	}
-	if report.EffectiveMode != api.ModeTUN {
-		t.Fatalf("expected TUN mode, got %+v", report)
+	if report.EffectiveMode != api.ModeSystem {
+		t.Fatalf("expected system mode (takeover), got %+v", report)
 	}
 }
 
-func TestStartUsesTUNWhenPersonalProxyOwnsSystemProxyAndCompanyUsesSystemRoute(t *testing.T) {
+func TestStartStaysSystemWhenPersonalProxyOwnsSystemProxyAndCompanyUsesSystemRoute(t *testing.T) {
 	personalStub := startSOCKS5Stub(t)
 	personalUpstream := upstreamFromAddress(t, personalStub)
 
@@ -212,13 +323,10 @@ func TestStartUsesTUNWhenPersonalProxyOwnsSystemProxyAndCompanyUsesSystemRoute(t
 
 	status, err := manager.Start(cfg)
 	if err != nil {
-		t.Fatalf("expected start to succeed with TUN fallback, got %v", err)
+		t.Fatalf("expected start to succeed in system mode (takeover), got %v", err)
 	}
-	if status.Mode != api.ModeTUN {
-		t.Fatalf("expected TUN mode, got %+v", status)
-	}
-	if !controller.cleared {
-		t.Fatal("expected existing system proxy to be cleared before TUN mode")
+	if status.Mode != api.ModeSystem {
+		t.Fatalf("expected system mode, got %+v", status)
 	}
 }
 
