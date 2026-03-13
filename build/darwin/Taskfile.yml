@@ -1,0 +1,65 @@
+version: '3'
+
+includes:
+  common: ../Taskfile.yml
+
+tasks:
+  build:
+    summary: Creates a production build of the application
+    deps:
+      - task: common:go:mod:tidy
+      - task: common:build:frontend
+      - task: common:generate:icons
+    cmds:
+      - go build {{.BUILD_FLAGS}} -o {{.OUTPUT}}
+    vars:
+      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production -trimpath -buildvcs=false -ldflags="-w -s"{{else}}-buildvcs=false -gcflags=all="-l"{{end}}'
+      DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
+      OUTPUT: '{{.OUTPUT | default .DEFAULT_OUTPUT}}'
+      TARGET_ARCH: '{{.ARCH | default ARCH}}'
+      CLANG_ARCH: '{{if eq .TARGET_ARCH "amd64"}}x86_64{{else}}arm64{{end}}'
+      MIN_MACOS: '{{if eq .TARGET_ARCH "arm64"}}11.0{{else}}10.15{{end}}'
+    env:
+      GOOS: darwin
+      CGO_ENABLED: 1
+      GOARCH: '{{.TARGET_ARCH}}'
+      CGO_CFLAGS: '-arch {{.CLANG_ARCH}} -mmacosx-version-min={{.MIN_MACOS}}'
+      CGO_LDFLAGS: '-arch {{.CLANG_ARCH}} -mmacosx-version-min={{.MIN_MACOS}}'
+      MACOSX_DEPLOYMENT_TARGET: '{{.MIN_MACOS}}'
+      PRODUCTION: '{{.PRODUCTION | default "false"}}'
+
+  package:
+    summary: Packages a production build of the application into a `.app` bundle
+    deps:
+      - task: common:update:build-assets
+      - task: build
+        vars:
+          PRODUCTION: 'true'
+    cmds:
+      - task: create:app:bundle
+
+  create:app:bundle:
+    summary: Creates an `.app` bundle
+    cmds:
+      - mkdir -p {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/{MacOS,Resources}
+      - cp build/darwin/icons.icns {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources
+      - cp {{.BIN_DIR}}/{{.APP_NAME}} {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS
+      - cp build/darwin/Info.plist {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents
+
+  create:dmg:
+    summary: Creates a `.dmg` archive for distribution
+    platforms:
+      - darwin
+    deps:
+      - task: package
+    cmds:
+      - rm -f {{.BIN_DIR}}/{{.APP_NAME}}.dmg
+      - rm -rf {{.BIN_DIR}}/.dmg-root
+      - mkdir -p {{.BIN_DIR}}/.dmg-root
+      - cp -R {{.BIN_DIR}}/{{.APP_NAME}}.app {{.BIN_DIR}}/.dmg-root/
+      - hdiutil create -volname {{.APP_NAME}} -srcfolder {{.BIN_DIR}}/.dmg-root -ov -format UDZO {{.BIN_DIR}}/{{.APP_NAME}}.dmg
+      - rm -rf {{.BIN_DIR}}/.dmg-root
+
+  run:
+    cmds:
+      - '{{.BIN_DIR}}/{{.APP_NAME}}'
