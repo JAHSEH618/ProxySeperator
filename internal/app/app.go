@@ -144,6 +144,18 @@ func (b *BackendAPI) RecoverNetwork(context.Context) error {
 	return nil
 }
 
+func (b *BackendAPI) ForceRecoverNetwork() error {
+	b.logger.Info("runtime", "收到强制恢复网络请求", nil)
+	err := b.manager.ForceRecoverNetwork()
+	defer b.restoreWindow()
+	if err != nil {
+		b.logger.Error("runtime", "强制恢复网络失败", map[string]any{"error": err.Error()})
+		return err
+	}
+	b.logger.Info("runtime", "系统网络状态已强制恢复", nil)
+	return nil
+}
+
 func (b *BackendAPI) SaveConfig(_ context.Context, cfg api.Config) error {
 	if err := validateConfig(cfg); err != nil {
 		b.logger.Warn("config", "配置校验失败", map[string]any{"error": err.Error()})

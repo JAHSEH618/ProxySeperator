@@ -163,6 +163,46 @@ func (m *Manager) RecoverNetwork() error {
 	return nil
 }
 
+// ForceRecoverNetwork forces a network recovery regardless of runtime state.
+// If the runtime is active, it stops it first, then recovers from the journal.
+// If no journal exists, falls back to a bare system proxy cleanup.
+// This is the "nuclear button" for the tray menu.
+func (m *Manager) ForceRecoverNetwork() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// If runtime is active, stop it first.
+	if m.status.State == api.RuntimeStateRunning || m.status.State == api.RuntimeStateStarting {
+		m.status.State = api.RuntimeStateStopping
+		m.emitStatus()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		m.rollbackLocked(stopCtx)
+		stopCancel()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Try journal-based recovery if journal still exists.
+	if m.journal.Exists() {
+		if _, err := m.recoverNetworkLocked(ctx, m.cfg); err != nil {
+			// Journal recovery failed — fall back to bare cleanup.
+			m.logger.Warn("runtime", "强制恢复：快照恢复失败，执行基础网络清理", map[string]any{"error": err.Error()})
+			_ = m.platform.ClearSystemProxy(ctx)
+			_ = m.journal.Remove()
+		}
+	} else {
+		// No journal — bare cleanup as last resort.
+		_ = m.platform.ClearSystemProxy(ctx)
+	}
+
+	m.status.LastErrorCode = ""
+	m.status.LastErrorMessage = ""
+	m.status.RecoveryRequired = false
+	m.emitStatus()
+	return nil
+}
+
 func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
