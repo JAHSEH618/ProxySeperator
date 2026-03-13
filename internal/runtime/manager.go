@@ -279,6 +279,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 
 	matcher := rules.NewMatcher(rules.ParseLines(m.cfg.Rules).Compiled)
 	m.forwarder = NewForwarder(m.cfg, matcher, m.dnsCache, m.stats, m.logger)
+	m.forwarder.SetEventEmitter(m.emitter.Emit)
 	m.httpProxy = proxy.NewHTTPServer(m.httpListenAddr, m.forwarder, m.logger)
 	m.socks5 = proxy.NewSOCKS5Server(m.socksListenAddr, m.forwarder, m.logger)
 

@@ -737,6 +737,101 @@ func TestStartBlocksWhenPersonalUpstreamUnreachable(t *testing.T) {
 	}
 }
 
+func TestGuardSystemProxyReappliesWhenTampered(t *testing.T) {
+	companyStub := startSOCKS5Stub(t)
+	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+	}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
+	cfg.PersonalUpstream = personalUpstream
+
+	if _, err := manager.Start(cfg); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer manager.Stop()
+
+	// Simulate external tool changing system proxy.
+	controller.applied = false
+	controller.systemProxy = api.SystemProxyState{
+		Enabled:      true,
+		HTTPAddress:  "127.0.0.1:7890",
+		HTTPSAddress: "127.0.0.1:7890",
+	}
+
+	// Run the guard check.
+	manager.guardSystemProxy(context.Background())
+
+	if !controller.applied {
+		t.Fatal("expected guardSystemProxy to re-apply system proxy when tampered")
+	}
+}
+
+func TestGuardSystemProxyNoopWhenCorrect(t *testing.T) {
+	companyStub := startSOCKS5Stub(t)
+	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+	}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
+	cfg.PersonalUpstream = personalUpstream
+
+	if _, err := manager.Start(cfg); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer manager.Stop()
+
+	// Set the system proxy to match what the manager expects.
+	controller.systemProxy = api.SystemProxyState{
+		Enabled:      true,
+		HTTPAddress:  manager.httpListenAddr,
+		HTTPSAddress: manager.httpListenAddr,
+	}
+	controller.applied = false
+
+	manager.guardSystemProxy(context.Background())
+
+	if controller.applied {
+		t.Fatal("expected guardSystemProxy to be a no-op when proxy is correct")
+	}
+}
+
 func upstreamFromAddress(t *testing.T, address string) api.UpstreamConfig {
 	t.Helper()
 	host, portString, err := net.SplitHostPort(address)
