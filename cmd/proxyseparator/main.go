@@ -60,10 +60,10 @@ func main() {
 	})
 
 	backend.BindEvents(func(name string, payload any) {
-		app.EmitEvent(name, payload)
+		app.Event.Emit(name, payload)
 	})
 
-	window := app.NewWebviewWindowWithOptions(application.WebviewWindowOptions{
+	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:  "ProxySeparator",
 		Width:  980,
 		Height: 720,
@@ -94,7 +94,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	tray := app.NewSystemTray()
+	tray := app.SystemTray.New()
 	tray.SetLabel("ProxySeparator")
 	tray.AttachWindow(window)
 	tray.OnClick(func() {

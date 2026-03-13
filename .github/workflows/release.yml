@@ -10,7 +10,7 @@ permissions:
 
 env:
   APP_NAME: ProxySeparator
-  WAILS_VERSION: v3.0.0-alpha.9
+  WAILS_VERSION: v3.0.0-alpha.64
   WINTUN_URL: https://www.wintun.net/builds/wintun-0.14.1.zip
 
 jobs:
