@@ -696,8 +696,12 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			health := m.forwarder.RefreshHealth(ctx)
 			m.mu.Lock()
 			m.health = health
+			mode := m.status.Mode
 			m.mu.Unlock()
 			m.emitHealth()
+			if mode == api.ModeSystem {
+				m.guardSystemProxy(ctx)
+			}
 		case <-companyTicker.C:
 			m.mu.Lock()
 			companyDialer := m.companyDomainDialer
@@ -726,6 +730,44 @@ func (m *Manager) emitHealth() {
 
 func (m *Manager) emitTraffic() {
 	m.emitter.Emit(api.EventRuntimeTraffic, m.stats.Snapshot(m.status.Mode))
+}
+
+// guardSystemProxy checks that the OS-level proxy settings still point to our
+// listeners.  If an external tool (Clash, V2Ray, etc.) overwrote them, we
+// re-apply ours and notify the user via an event.
+func (m *Manager) guardSystemProxy(parent context.Context) {
+	checkCtx, checkCancel := context.WithTimeout(parent, 2*time.Second)
+	defer checkCancel()
+
+	current, err := m.platform.CurrentSystemProxy(checkCtx)
+	if err != nil {
+		m.logger.Warn("runtime", "检查系统代理状态失败", map[string]any{"error": err.Error()})
+		return
+	}
+
+	expected := m.systemProxyConfig()
+	if current.Enabled &&
+		current.HTTPAddress == expected.HTTPAddress &&
+		current.HTTPSAddress == expected.HTTPSAddress {
+		return
+	}
+
+	m.logger.Warn("runtime", "系统代理被外部修改，正在自动恢复", map[string]any{
+		"expected_http":   expected.HTTPAddress,
+		"current_http":    current.HTTPAddress,
+		"current_enabled": current.Enabled,
+	})
+
+	applyCtx, applyCancel := context.WithTimeout(parent, 2*time.Second)
+	defer applyCancel()
+
+	if err := m.platform.ApplySystemProxy(applyCtx, expected); err != nil {
+		m.logger.Error("runtime", "自动恢复系统代理失败", map[string]any{"error": err.Error()})
+		return
+	}
+	m.emitter.Emit(api.EventRuntimeError, map[string]any{
+		"message": "系统代理被外部修改，已自动恢复",
+	})
 }
 
 func (m *Manager) systemProxyConfig() platform.SystemProxyConfig {
