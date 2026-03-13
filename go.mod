@@ -1,6 +1,6 @@
 module github.com/friedhelmliu/ProxySeperator
 
-go 1.25
+go 1.26
 
 require (
 	github.com/miekg/dns v1.1.63
