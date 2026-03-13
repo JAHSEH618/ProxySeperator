@@ -17,6 +17,7 @@
 - 配置 macOS 和 Windows 平台的 Taskfile 任务定义，支持一键构建、打包和分发。
 - 新增 GitHub Actions 自动发布工作流，支持 macOS（amd64/arm64）和 Windows（amd64）多架构构建。
 - 配置 NSIS 安装包模板用于 Windows 平台分发。
+- 新增托盘"Repair Network"紧急按钮，无需打开主窗口即可强制恢复网络状态，运行中也可使用。
 
 ## [2026-03-12] - `unreleased`
 
