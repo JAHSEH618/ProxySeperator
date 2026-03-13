@@ -120,6 +120,27 @@ func main() {
 	})
 	tray.SetMenu(trayMenu)
 
+	// Periodically update the tray label to reflect the runtime state.
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			status, _ := backend.GetRuntimeStatus(context.Background())
+			switch status.State {
+			case "running":
+				mode := "System"
+				if status.Mode == "tun" {
+					mode = "TUN"
+				}
+				tray.SetLabel(fmt.Sprintf("PS - %s", mode))
+			case "error":
+				tray.SetLabel("PS - Error")
+			default:
+				tray.SetLabel("PS")
+			}
+		}
+	}()
+
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}

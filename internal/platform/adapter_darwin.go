@@ -74,26 +74,46 @@ func (c *darwinController) ApplySystemProxy(ctx context.Context, cfg SystemProxy
 	if err != nil {
 		return api.WrapError(api.ErrCodeSystemProxyFailed, "无效的 SOCKS 代理地址", err)
 	}
+
+	var succeeded int
+	var lastErr error
 	for _, service := range services {
-		if err := run(ctx, "networksetup", "-setwebproxy", service, hostHTTP, portHTTP); err != nil {
-			return api.WrapError(api.ErrCodeSystemProxyFailed, "设置 Web 代理失败", err)
+		if err := c.applyProxyForService(ctx, service, hostHTTP, portHTTP, hostSOCKS, portSOCKS); err != nil {
+			c.logger.Warn("platform", "设置代理失败，跳过此服务", map[string]any{
+				"service": service,
+				"error":   err.Error(),
+			})
+			lastErr = err
+			continue
 		}
-		if err := run(ctx, "networksetup", "-setsecurewebproxy", service, hostHTTP, portHTTP); err != nil {
-			return api.WrapError(api.ErrCodeSystemProxyFailed, "设置 Secure Web 代理失败", err)
-		}
-		if err := run(ctx, "networksetup", "-setsocksfirewallproxy", service, hostSOCKS, portSOCKS); err != nil {
-			return api.WrapError(api.ErrCodeSystemProxyFailed, "设置 SOCKS 代理失败", err)
-		}
-		if err := run(ctx, "networksetup", "-setwebproxystate", service, "on"); err != nil {
-			return api.WrapError(api.ErrCodeSystemProxyFailed, "开启 Web 代理失败", err)
-		}
-		if err := run(ctx, "networksetup", "-setsecurewebproxystate", service, "on"); err != nil {
-			return api.WrapError(api.ErrCodeSystemProxyFailed, "开启 Secure Web 代理失败", err)
-		}
-		if err := run(ctx, "networksetup", "-setsocksfirewallproxystate", service, "on"); err != nil {
-			return api.WrapError(api.ErrCodeSystemProxyFailed, "开启 SOCKS 代理失败", err)
-		}
+		succeeded++
 	}
+
+	if succeeded == 0 && lastErr != nil {
+		return api.WrapError(api.ErrCodeSystemProxyFailed, "所有网络服务设置代理均失败", lastErr)
+	}
+	if lastErr != nil {
+		c.logger.Warn("platform", "部分网络服务设置代理失败", map[string]any{
+			"succeeded": succeeded,
+			"total":     len(services),
+		})
+	}
+	return nil
+}
+
+func (c *darwinController) applyProxyForService(ctx context.Context, service, hostHTTP, portHTTP, hostSOCKS, portSOCKS string) error {
+	if err := run(ctx, "networksetup", "-setwebproxy", service, hostHTTP, portHTTP); err != nil {
+		return err
+	}
+	if err := run(ctx, "networksetup", "-setsecurewebproxy", service, hostHTTP, portHTTP); err != nil {
+		return err
+	}
+	if err := run(ctx, "networksetup", "-setsocksfirewallproxy", service, hostSOCKS, portSOCKS); err != nil {
+		return err
+	}
+	_ = run(ctx, "networksetup", "-setwebproxystate", service, "on")
+	_ = run(ctx, "networksetup", "-setsecurewebproxystate", service, "on")
+	_ = run(ctx, "networksetup", "-setsocksfirewallproxystate", service, "on")
 	return nil
 }
 

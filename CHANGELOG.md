@@ -10,6 +10,9 @@
 - 移除 `rollbackLocked` 已废弃的 `clearJournal` 参数，简化所有调用方。
 - Start 中途失败的回滚路径现在也优先使用恢复快照还原网络状态，与 Stop 行为一致。
 - `rollbackLocked` 每个清理步骤改为独立超时（DNS/代理清除 2s、TUN/快照恢复 5s），防止单步阻塞导致后续清理全部失败。
+- macOS `ApplySystemProxy` 改为逐服务尝试，部分失败时跳过并继续，仅全部失败才报错。
+- `SaveConfig` 在运行时活跃期间自动触发 400ms 防抖重启，快速连续变更只产生一次实际重启。
+- 托盘标签根据运行状态动态显示模式（System/TUN）或空闲/异常状态。
 
 ### Added
 - 新增 Start 失败后 rollback 走快照恢复路径的测试覆盖。
