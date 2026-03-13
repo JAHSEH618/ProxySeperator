@@ -17,6 +17,8 @@ type BackendAPIInterface interface {
 	GetRuntimeStatus(context.Context) (api.RuntimeStatus, error)
 	GetHealthStatus(context.Context) (api.HealthStatus, error)
 	GetTrafficStats(context.Context) (api.TrafficStats, error)
+	GetRecentConnections(context.Context) ([]api.ConnectionRecord, error)
+	ListRuleTemplates(context.Context) ([]api.RuleTemplate, error)
 	TestRoute(context.Context, string) (api.RouteTestResult, error)
 	ValidateRules(context.Context, []string) (api.RuleValidationResult, error)
 	ListLogs(context.Context, int) ([]api.LogEntry, error)

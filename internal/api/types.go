@@ -46,11 +46,12 @@ const (
 )
 
 const (
-	EventRuntimeStatus  = "runtime:status"
-	EventRuntimeHealth  = "runtime:health"
-	EventRuntimeTraffic = "runtime:traffic"
-	EventRuntimeError   = "runtime:error"
-	EventRuntimeLog     = "runtime:log"
+	EventRuntimeStatus      = "runtime:status"
+	EventRuntimeHealth      = "runtime:health"
+	EventRuntimeTraffic     = "runtime:traffic"
+	EventRuntimeError       = "runtime:error"
+	EventRuntimeLog         = "runtime:log"
+	EventRuntimeConnections = "runtime:connections"
 )
 
 type UpstreamConfig struct {
@@ -251,6 +252,94 @@ type LogEntry struct {
 	Module    string         `json:"module"`
 	Message   string         `json:"message"`
 	Fields    map[string]any `json:"fields,omitempty"`
+}
+
+type ConnectionRecord struct {
+	ID          int64     `json:"id"`
+	Destination string    `json:"destination"`
+	Target      string    `json:"target"`
+	RuleType    string    `json:"ruleType"`
+	MatchedRule string    `json:"matchedRule,omitempty"`
+	ConnectedAt time.Time `json:"connectedAt"`
+}
+
+type RuleTemplate struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Rules       []string `json:"rules"`
+}
+
+func BuiltinRuleTemplates() []RuleTemplate {
+	return []RuleTemplate{
+		{
+			ID:          "bytedance",
+			Name:        "字节跳动",
+			Description: "字节跳动内网域名与常用 CIDR",
+			Rules: []string{
+				".bytedance.net",
+				".bytedance.com",
+				".byted.org",
+				".feishu.cn",
+				".feishu.net",
+				".larksuite.com",
+				".volcengine.com",
+				"10.0.0.0/8",
+			},
+		},
+		{
+			ID:          "alibaba",
+			Name:        "阿里巴巴",
+			Description: "阿里巴巴内网域名与常用 CIDR",
+			Rules: []string{
+				".alibaba-inc.com",
+				".alipay.net",
+				".antgroup-inc.cn",
+				".taobao.org",
+				".aone.alibaba-inc.com",
+				".aliyun-inc.com",
+				"10.0.0.0/8",
+				"100.64.0.0/10",
+			},
+		},
+		{
+			ID:          "tencent",
+			Name:        "腾讯",
+			Description: "腾讯内网域名与常用 CIDR",
+			Rules: []string{
+				".tencent.com",
+				".woa.com",
+				".oa.com",
+				".weixin.qq.com",
+				".km.woa.com",
+				"10.0.0.0/8",
+				"9.0.0.0/8",
+			},
+		},
+		{
+			ID:          "meituan",
+			Name:        "美团",
+			Description: "美团内网域名与常用 CIDR",
+			Rules: []string{
+				".meituan.com",
+				".sankuai.com",
+				".dianping.com",
+				".mws.sankuai.com",
+				"10.0.0.0/8",
+			},
+		},
+		{
+			ID:          "private-cidr",
+			Name:        "RFC 1918 私有网段",
+			Description: "所有标准私有 IP 地址段",
+			Rules: []string{
+				"10.0.0.0/8",
+				"172.16.0.0/12",
+				"192.168.0.0/16",
+				"100.64.0.0/10",
+			},
+		},
+	}
 }
 
 func itoa(v int) string {

@@ -42,6 +42,7 @@ type BackendAPI struct {
 	cfg             api.Config
 	onWindowRestore func()
 	debounceTimer   *time.Timer
+	fileSink        *logging.FileSink
 }
 
 func NewBackendAPI() *BackendAPI {
@@ -60,6 +61,15 @@ func NewBackendAPI() *BackendAPI {
 			RecoveryJournalPath: journalPath,
 		}),
 		cfg: api.DefaultConfig(),
+	}
+
+	if logDir, err := store.LogDir(); err == nil {
+		if fs, err := logging.NewFileSink(logging.FileSinkOptions{Dir: logDir}); err == nil {
+			logger.AddSink(fs.Sink())
+			apiService.fileSink = fs
+		} else {
+			logger.Warn("logging", "初始化文件日志失败", map[string]any{"error": err.Error()})
+		}
 	}
 
 	if cfg, err := store.Load(); err == nil {
@@ -259,6 +269,14 @@ func (b *BackendAPI) GetTrafficStats(context.Context) (api.TrafficStats, error) 
 	return b.manager.Traffic(), nil
 }
 
+func (b *BackendAPI) GetRecentConnections(context.Context) ([]api.ConnectionRecord, error) {
+	return b.manager.RecentConnections(), nil
+}
+
+func (b *BackendAPI) ListRuleTemplates(context.Context) ([]api.RuleTemplate, error) {
+	return api.BuiltinRuleTemplates(), nil
+}
+
 func (b *BackendAPI) TestRoute(_ context.Context, input string) (api.RouteTestResult, error) {
 	cfg, err := b.ensureConfig()
 	if err != nil {
@@ -344,6 +362,9 @@ func (b *BackendAPI) SetLanguage(_ context.Context, lang string) error {
 func (b *BackendAPI) Shutdown(context.Context) error {
 	if err := b.manager.Stop(); err != nil && api.ErrorCode(err) != api.ErrCodeRuntimeNotRunning {
 		return err
+	}
+	if b.fileSink != nil {
+		_ = b.fileSink.Close()
 	}
 	return nil
 }

@@ -496,6 +496,16 @@ func (m *Manager) Traffic() api.TrafficStats {
 	return m.stats.Snapshot(m.status.Mode)
 }
 
+func (m *Manager) RecentConnections() []api.ConnectionRecord {
+	m.mu.Lock()
+	f := m.forwarder
+	m.mu.Unlock()
+	if f == nil {
+		return nil
+	}
+	return f.RecentConnections()
+}
+
 func (m *Manager) TestRoute(input string) api.RouteTestResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -718,6 +728,7 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 		case <-trafficTicker.C:
 			m.emitTraffic()
 			m.emitStatus()
+			m.emitConnections()
 		}
 	}
 }
@@ -736,6 +747,12 @@ func (m *Manager) emitHealth() {
 
 func (m *Manager) emitTraffic() {
 	m.emitter.Emit(api.EventRuntimeTraffic, m.stats.Snapshot(m.status.Mode))
+}
+
+func (m *Manager) emitConnections() {
+	if m.forwarder != nil {
+		m.emitter.Emit(api.EventRuntimeConnections, m.forwarder.RecentConnections())
+	}
 }
 
 // checkListenersAlive verifies that the HTTP and SOCKS5 proxy listeners are

@@ -31,6 +31,10 @@ type Forwarder struct {
 	failOpenDirect   bool
 	personalDegraded bool
 	emitEvent        func(string, any)
+
+	connMu      sync.Mutex
+	connections []api.ConnectionRecord
+	connIDSeq   int64
 }
 
 func NewForwarder(cfg api.Config, matcher *rules.Matcher, dnsCache *localdns.Cache, stats *StatsTracker, logger *logging.Logger) *Forwarder {
@@ -128,8 +132,37 @@ func (f *Forwarder) DialTarget(ctx context.Context, network, addr string) (net.C
 	if err != nil {
 		return nil, target, err
 	}
+	f.recordConnection(addr, target, result.RuleType, result.MatchedRule)
 	f.stats.SessionStarted()
 	return &trackedConn{Conn: conn, target: target, stats: f.stats}, target, nil
+}
+
+const maxConnections = 200
+
+func (f *Forwarder) recordConnection(dest, target, ruleType, matchedRule string) {
+	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	f.connIDSeq++
+	rec := api.ConnectionRecord{
+		ID:          f.connIDSeq,
+		Destination: dest,
+		Target:      target,
+		RuleType:    ruleType,
+		MatchedRule: matchedRule,
+		ConnectedAt: time.Now(),
+	}
+	f.connections = append(f.connections, rec)
+	if len(f.connections) > maxConnections {
+		f.connections = f.connections[len(f.connections)-maxConnections:]
+	}
+}
+
+func (f *Forwarder) RecentConnections() []api.ConnectionRecord {
+	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	out := make([]api.ConnectionRecord, len(f.connections))
+	copy(out, f.connections)
+	return out
 }
 
 func (f *Forwarder) notifyDegraded() {

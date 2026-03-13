@@ -1,5 +1,6 @@
 import type {
   Config,
+  ConnectionRecord,
   HealthStatus,
   LogEntry,
   PreflightReport,
@@ -73,6 +74,7 @@ export const backend = {
   validateRules: (lines: string[]) => call<RuleValidationResult>("ValidateRules", lines),
   listLogs: (limit = 20) => call<LogEntry[]>("ListLogs", limit),
   setLanguage: (language: string) => call<void>("SetLanguage", language),
+  getRecentConnections: () => call<ConnectionRecord[]>("GetRecentConnections"),
 };
 
 export const runtimeEvents = {
@@ -86,4 +88,6 @@ export const runtimeEvents = {
     getRuntime().Events.On("runtime:error", (event) => handler(unwrapEventData(event))),
   onRuntimeLog: (handler: (payload: LogEntry) => void) =>
     getRuntime().Events.On("runtime:log", (event) => handler(unwrapEventData(event) as LogEntry)),
+  onRuntimeConnections: (handler: (payload: ConnectionRecord[]) => void) =>
+    getRuntime().Events.On("runtime:connections", (event) => handler(unwrapEventData(event) as ConnectionRecord[])),
 };

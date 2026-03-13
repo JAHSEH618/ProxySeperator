@@ -44,6 +44,14 @@ func (s *Store) RecoveryJournalPath() (string, error) {
 	return filepath.Join(dir, "recovery-journal.json"), nil
 }
 
+func (s *Store) LogDir() (string, error) {
+	dir, err := s.ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "logs"), nil
+}
+
 func (s *Store) ensureDir() (string, error) {
 	dir, err := s.ConfigDir()
 	if err != nil {

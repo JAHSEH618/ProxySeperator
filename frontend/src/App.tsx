@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { backend, runtimeEvents } from "./lib/backend";
 import type {
   Config,
+  ConnectionRecord,
   HealthStatus,
   LogEntry,
   PreflightReport,
@@ -95,6 +96,7 @@ type IconName =
   | "activity"
   | "chevronDown"
   | "chevronUp"
+  | "connection"
   | "copy"
   | "logs"
   | "play"
@@ -523,6 +525,12 @@ function Icon({ name, className }: { name: IconName; className?: string }) {
           <path d="m6 15 6-6 6 6" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       );
+    case "connection":
+      return (
+        <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+          <path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48 2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48 2.83-2.83" strokeLinecap="round" />
+        </svg>
+      );
     case "copy":
       return (
         <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -689,6 +697,7 @@ export function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [advancedExpanded, setAdvancedExpanded] = useState(true);
   const [routeTesterOpen, setRouteTesterOpen] = useState(false);
+  const [connections, setConnections] = useState<ConnectionRecord[]>([]);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
@@ -736,6 +745,11 @@ export function App() {
       runtimeEvents.onRuntimeHealth(applyHealthStatus),
       runtimeEvents.onRuntimeTraffic(setTraffic),
       runtimeEvents.onRuntimeLog(appendLogEntry),
+      runtimeEvents.onRuntimeConnections((payload) => {
+        if (Array.isArray(payload)) {
+          setConnections(payload);
+        }
+      }),
       runtimeEvents.onRuntimeError((payload) => {
         setNotice({
           tone: "error",
@@ -1300,6 +1314,38 @@ export function App() {
                   累计连接 {traffic?.totalSessions ?? 0} · 最近刷新 {formatTimestamp(health?.checkedAt)}
                 </span>
               </div>
+
+              <section className="connections-panel">
+                <div className="connections-panel__header">
+                  <h3>
+                    <Icon name="connection" className="inline-icon" />
+                    {" "}最近连接
+                  </h3>
+                  <span className="connections-panel__count">{connections.length}</span>
+                </div>
+
+                {connections.length > 0 ? (
+                  <div className="connections-list">
+                    {connections.slice(-20).reverse().map((conn) => (
+                      <div className="connection-item" key={conn.id}>
+                        <div className="connection-item__main">
+                          <span className="connection-item__dest">{conn.destination}</span>
+                          <span className={`connection-item__target connection-item__target--${conn.target}`}>
+                            {formatRouteTarget(conn.target)}
+                          </span>
+                        </div>
+                        <div className="connection-item__meta">
+                          <span>{formatRuleType(conn.ruleType)}</span>
+                          {conn.matchedRule ? <span>{conn.matchedRule}</span> : null}
+                          <span>{formatTimestamp(conn.connectedAt)}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="logs-empty">启动后这里会显示最近的连接记录</div>
+                )}
+              </section>
 
               <section className="logs-panel" ref={logSectionRef}>
                 <div className="logs-panel__header">

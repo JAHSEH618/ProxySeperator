@@ -125,3 +125,13 @@ export type LogEntry = {
   message: string;
   fields?: Record<string, unknown>;
 };
+
+export type ConnectionRecord = {
+  id: number;
+  destination: string;
+  target: string;
+  ruleType: string;
+  matchedRule?: string;
+  connectedAt: string;
+};
+
