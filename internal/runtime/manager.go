@@ -579,13 +579,19 @@ func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (boo
 	return true, nil
 }
 
-func (m *Manager) rollbackLocked(ctx context.Context) {
+func (m *Manager) rollbackLocked(_ context.Context) {
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
 	}
+
+	// Each cleanup step gets its own independent timeout so that one
+	// blocking step (e.g. TUN auth dialog) cannot starve the others.
+
 	if m.httpProxy != nil {
-		_ = m.httpProxy.Stop(ctx)
+		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = m.httpProxy.Stop(proxyCtx)
+		proxyCancel()
 		m.httpProxy = nil
 	}
 	if m.socks5 != nil {
@@ -594,19 +600,24 @@ func (m *Manager) rollbackLocked(ctx context.Context) {
 	}
 
 	if m.dns != nil {
-		_ = m.dns.Stop(ctx)
+		dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := m.dns.Stop(dnsCtx); err != nil {
+			m.logger.Warn("runtime", "停止 DNS 服务失败", map[string]any{"error": err.Error()})
+		}
+		dnsCancel()
 	}
 
 	recoveredFromJournal := false
 	var rollbackErr error
 	if m.journal.Exists() {
+		recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		snapshot, err := m.journal.Load()
 		if err != nil {
 			rollbackErr = err
 			m.logger.Warn("runtime", "读取恢复快照失败，回退到基础网络清理", map[string]any{
 				"error": err.Error(),
 			})
-		} else if err := m.platform.RecoverNetwork(ctx, snapshot); err != nil {
+		} else if err := m.platform.RecoverNetwork(recoverCtx, snapshot); err != nil {
 			rollbackErr = err
 			m.logger.Warn("runtime", "按恢复快照还原网络失败，回退到基础网络清理", map[string]any{
 				"error": err.Error(),
@@ -620,19 +631,30 @@ func (m *Manager) rollbackLocked(ctx context.Context) {
 				})
 			}
 		}
+		recoverCancel()
 	}
 
 	if !recoveredFromJournal && m.status.Mode == api.ModeTUN {
-		_ = m.platform.StopTUN(ctx)
+		tunCtx, tunCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := m.platform.StopTUN(tunCtx); err != nil {
+			m.logger.Warn("runtime", "停止 TUN 失败", map[string]any{"error": err.Error()})
+		}
+		tunCancel()
 	} else if !recoveredFromJournal {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		routes := append([]string(nil), m.companyBypassRoutes...)
 		if m.companyDomainDialer != nil {
 			routes = mergeRouteLists(routes, m.companyDomainDialer.DynamicRoutes())
 		}
 		if m.companyBypassInterface != "" && len(routes) > 0 {
-			_ = m.platform.ClearCompanyBypassRoutes(ctx, m.companyBypassInterface, routes)
+			if err := m.platform.ClearCompanyBypassRoutes(cleanCtx, m.companyBypassInterface, routes); err != nil {
+				m.logger.Warn("runtime", "清理公司旁路路由失败", map[string]any{"error": err.Error()})
+			}
 		}
-		_ = m.platform.ClearSystemProxy(ctx)
+		if err := m.platform.ClearSystemProxy(cleanCtx); err != nil {
+			m.logger.Warn("runtime", "清除系统代理失败", map[string]any{"error": err.Error()})
+		}
+		cleanCancel()
 	}
 
 	m.dns = nil
