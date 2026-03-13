@@ -13,6 +13,10 @@
 ### Added
 - 新增 Start 失败后 rollback 走快照恢复路径的测试覆盖。
 - 新增 Stop 恢复失败时错误码与错误消息保留的断言。
+- 集成 Wails 3 构建系统，添加开发和生产环境资源文件系统实现（`appassets_dev.go`/`appassets_production.go`）。
+- 配置 macOS 和 Windows 平台的 Taskfile 任务定义，支持一键构建、打包和分发。
+- 新增 GitHub Actions 自动发布工作流，支持 macOS（amd64/arm64）和 Windows（amd64）多架构构建。
+- 配置 NSIS 安装包模板用于 Windows 平台分发。
 
 ## [2026-03-12] - `unreleased`
 
