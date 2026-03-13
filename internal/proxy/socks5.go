@@ -33,6 +33,13 @@ func (s *SOCKS5Server) Start(context.Context) error {
 	return nil
 }
 
+func (s *SOCKS5Server) Addr() string {
+	if s.listener != nil {
+		return s.listener.Addr().String()
+	}
+	return s.address
+}
+
 func (s *SOCKS5Server) Stop() error {
 	if s.listener == nil {
 		return nil

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -703,6 +704,10 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			if mode == api.ModeSystem {
 				m.guardSystemProxy(ctx)
 			}
+			if !m.checkListenersAlive() {
+				m.handleDeadListeners()
+				return
+			}
 		case <-companyTicker.C:
 			m.mu.Lock()
 			companyDialer := m.companyDomainDialer
@@ -731,6 +736,48 @@ func (m *Manager) emitHealth() {
 
 func (m *Manager) emitTraffic() {
 	m.emitter.Emit(api.EventRuntimeTraffic, m.stats.Snapshot(m.status.Mode))
+}
+
+// checkListenersAlive verifies that the HTTP and SOCKS5 proxy listeners are
+// still accepting connections.  A quick TCP dial is used as the probe.
+func (m *Manager) checkListenersAlive() bool {
+	m.mu.Lock()
+	hp := m.httpProxy
+	sp := m.socks5
+	m.mu.Unlock()
+
+	if hp == nil || sp == nil {
+		return false
+	}
+
+	for _, addr := range []string{hp.Addr(), sp.Addr()} {
+		conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+	}
+	return true
+}
+
+// handleDeadListeners is called when a local proxy listener is no longer
+// reachable.  It tears down the runtime and restores the user's original
+// network state so traffic does not black-hole into a dead port.
+func (m *Manager) handleDeadListeners() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.logger.Error("runtime", "本地代理监听已失效，正在恢复网络状态", nil)
+	m.status.State = api.RuntimeStateStopping
+	m.emitStatus()
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+	m.rollbackLocked(stopCtx)
+
+	m.emitter.Emit(api.EventRuntimeError, map[string]any{
+		"message": "本地代理监听异常退出，已自动恢复网络状态",
+	})
 }
 
 // guardSystemProxy checks that the OS-level proxy settings still point to our

@@ -52,6 +52,13 @@ func (s *HTTPServer) Start(ctx context.Context) error {
 	return nil
 }
 
+func (s *HTTPServer) Addr() string {
+	if s.listener != nil {
+		return s.listener.Addr().String()
+	}
+	return s.address
+}
+
 func (s *HTTPServer) Stop(ctx context.Context) error {
 	if s.server == nil {
 		return nil
