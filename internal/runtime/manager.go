@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -163,6 +164,46 @@ func (m *Manager) RecoverNetwork() error {
 	return nil
 }
 
+// ForceRecoverNetwork forces a network recovery regardless of runtime state.
+// If the runtime is active, it stops it first, then recovers from the journal.
+// If no journal exists, falls back to a bare system proxy cleanup.
+// This is the "nuclear button" for the tray menu.
+func (m *Manager) ForceRecoverNetwork() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// If runtime is active, stop it first.
+	if m.status.State == api.RuntimeStateRunning || m.status.State == api.RuntimeStateStarting {
+		m.status.State = api.RuntimeStateStopping
+		m.emitStatus()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		m.rollbackLocked(stopCtx)
+		stopCancel()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Try journal-based recovery if journal still exists.
+	if m.journal.Exists() {
+		if _, err := m.recoverNetworkLocked(ctx, m.cfg); err != nil {
+			// Journal recovery failed — fall back to bare cleanup.
+			m.logger.Warn("runtime", "强制恢复：快照恢复失败，执行基础网络清理", map[string]any{"error": err.Error()})
+			_ = m.platform.ClearSystemProxy(ctx)
+			_ = m.journal.Remove()
+		}
+	} else {
+		// No journal — bare cleanup as last resort.
+		_ = m.platform.ClearSystemProxy(ctx)
+	}
+
+	m.status.LastErrorCode = ""
+	m.status.LastErrorMessage = ""
+	m.status.RecoveryRequired = false
+	m.emitStatus()
+	return nil
+}
+
 func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -239,6 +280,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 
 	matcher := rules.NewMatcher(rules.ParseLines(m.cfg.Rules).Compiled)
 	m.forwarder = NewForwarder(m.cfg, matcher, m.dnsCache, m.stats, m.logger)
+	m.forwarder.SetEventEmitter(m.emitter.Emit)
 	m.httpProxy = proxy.NewHTTPServer(m.httpListenAddr, m.forwarder, m.logger)
 	m.socks5 = proxy.NewSOCKS5Server(m.socksListenAddr, m.forwarder, m.logger)
 
@@ -258,14 +300,14 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 
 	m.stats.Start(report.EffectiveMode)
 	if err := m.httpProxy.Start(runCtx); err != nil {
-		m.rollbackLocked(runCtx, false)
+		m.rollbackLocked(runCtx)
 		m.status.LastErrorCode = api.ErrorCode(err)
 		m.status.LastErrorMessage = err.Error()
 		m.emitStatus()
 		return m.status, err
 	}
 	if err := m.socks5.Start(runCtx); err != nil {
-		m.rollbackLocked(runCtx, false)
+		m.rollbackLocked(runCtx)
 		m.status.LastErrorCode = api.ErrorCode(err)
 		m.status.LastErrorMessage = err.Error()
 		m.emitStatus()
@@ -274,7 +316,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 
 	if report.EffectiveMode == api.ModeTUN {
 		if err := m.dns.Start(); err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			wrapped := api.WrapError(api.ErrCodeRuntimeStartFailed, "启动本地 DNS 失败", err)
 			m.status.LastErrorCode = wrapped.Code
 			m.status.LastErrorMessage = wrapped.Error()
@@ -283,7 +325,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		}
 		egress, err := m.platform.DefaultEgressInterface(runCtx)
 		if err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			wrapped := api.WrapError(api.ErrCodeTUNUnavailable, "无法识别默认出口接口", err)
 			m.status.LastErrorCode = wrapped.Code
 			m.status.LastErrorMessage = wrapped.Error()
@@ -296,7 +338,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			EgressInterface:    egress,
 			MTU:                1500,
 		}); err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			m.status.LastErrorCode = api.ErrorCode(err)
 			m.status.LastErrorMessage = err.Error()
 			m.emitStatus()
@@ -304,7 +346,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		}
 		if snapshot.SystemProxy.Enabled {
 			if err := m.platform.ClearSystemProxy(runCtx); err != nil {
-				m.rollbackLocked(runCtx, false)
+				m.rollbackLocked(runCtx)
 				wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "切换到 TUN 模式前清理系统代理失败", err)
 				m.status.LastErrorCode = wrapped.Code
 				m.status.LastErrorMessage = wrapped.Error()
@@ -324,7 +366,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			if len(bypassRoutes) > 0 {
 				iface, err := m.platform.PreferredCompanyBypassInterface(runCtx)
 				if err != nil {
-					m.rollbackLocked(runCtx, false)
+					m.rollbackLocked(runCtx)
 					wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "无法识别公司旁路接口", err)
 					m.status.LastErrorCode = wrapped.Code
 					m.status.LastErrorMessage = wrapped.Error()
@@ -332,7 +374,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 					return m.status, wrapped
 				}
 				if err := m.platform.ApplyCompanyBypassRoutes(runCtx, iface, bypassRoutes); err != nil {
-					m.rollbackLocked(runCtx, false)
+					m.rollbackLocked(runCtx)
 					m.status.LastErrorCode = api.ErrorCode(err)
 					m.status.LastErrorMessage = err.Error()
 					m.emitStatus()
@@ -377,7 +419,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			m.forwarder.SetCompanyDialPreparer(m.companyDomainDialer)
 		}
 		if err := m.platform.ApplySystemProxy(runCtx, m.systemProxyConfig()); err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			m.status.LastErrorCode = api.ErrorCode(err)
 			m.status.LastErrorMessage = err.Error()
 			m.emitStatus()
@@ -418,9 +460,11 @@ func (m *Manager) Stop() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	m.rollbackLocked(ctx, true)
-	m.status.LastErrorCode = ""
-	m.status.LastErrorMessage = ""
+	m.rollbackLocked(ctx)
+	if !m.status.RecoveryRequired {
+		m.status.LastErrorCode = ""
+		m.status.LastErrorMessage = ""
+	}
 	return nil
 }
 
@@ -537,48 +581,100 @@ func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (boo
 	return true, nil
 }
 
-func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {
+func (m *Manager) rollbackLocked(_ context.Context) {
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
 	}
+
+	// Each cleanup step gets its own independent timeout so that one
+	// blocking step (e.g. TUN auth dialog) cannot starve the others.
+
 	if m.httpProxy != nil {
-		_ = m.httpProxy.Stop(ctx)
+		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = m.httpProxy.Stop(proxyCtx)
+		proxyCancel()
 		m.httpProxy = nil
 	}
 	if m.socks5 != nil {
 		_ = m.socks5.Stop()
 		m.socks5 = nil
 	}
-	if m.status.Mode == api.ModeTUN {
-		if m.dns != nil {
-			_ = m.dns.Stop(ctx)
+
+	if m.dns != nil {
+		dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := m.dns.Stop(dnsCtx); err != nil {
+			m.logger.Warn("runtime", "停止 DNS 服务失败", map[string]any{"error": err.Error()})
 		}
-		_ = m.platform.StopTUN(ctx)
-	} else {
+		dnsCancel()
+	}
+
+	recoveredFromJournal := false
+	var rollbackErr error
+	if m.journal.Exists() {
+		recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		snapshot, err := m.journal.Load()
+		if err != nil {
+			rollbackErr = err
+			m.logger.Warn("runtime", "读取恢复快照失败，回退到基础网络清理", map[string]any{
+				"error": err.Error(),
+			})
+		} else if err := m.platform.RecoverNetwork(recoverCtx, snapshot); err != nil {
+			rollbackErr = err
+			m.logger.Warn("runtime", "按恢复快照还原网络失败，回退到基础网络清理", map[string]any{
+				"error": err.Error(),
+				"mode":  snapshot.Mode,
+			})
+		} else {
+			recoveredFromJournal = true
+			if err := m.journal.Remove(); err != nil {
+				m.logger.Warn("runtime", "删除恢复快照失败", map[string]any{
+					"error": err.Error(),
+				})
+			}
+		}
+		recoverCancel()
+	}
+
+	if !recoveredFromJournal && m.status.Mode == api.ModeTUN {
+		tunCtx, tunCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := m.platform.StopTUN(tunCtx); err != nil {
+			m.logger.Warn("runtime", "停止 TUN 失败", map[string]any{"error": err.Error()})
+		}
+		tunCancel()
+	} else if !recoveredFromJournal {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		routes := append([]string(nil), m.companyBypassRoutes...)
 		if m.companyDomainDialer != nil {
 			routes = mergeRouteLists(routes, m.companyDomainDialer.DynamicRoutes())
 		}
 		if m.companyBypassInterface != "" && len(routes) > 0 {
-			_ = m.platform.ClearCompanyBypassRoutes(ctx, m.companyBypassInterface, routes)
+			if err := m.platform.ClearCompanyBypassRoutes(cleanCtx, m.companyBypassInterface, routes); err != nil {
+				m.logger.Warn("runtime", "清理公司旁路路由失败", map[string]any{"error": err.Error()})
+			}
 		}
-		_ = m.platform.ClearSystemProxy(ctx)
+		if err := m.platform.ClearSystemProxy(cleanCtx); err != nil {
+			m.logger.Warn("runtime", "清除系统代理失败", map[string]any{"error": err.Error()})
+		}
+		cleanCancel()
 	}
+
 	m.dns = nil
 	m.dnsCache.Clear()
 	m.stats.Stop()
-	if clearJournal {
-		_ = m.journal.Remove()
-	}
 	mode := m.status.Mode
 	requested := m.status.RequestedMode
-	recoveryRequired := clearJournal && m.journal.Exists()
+	recoveryRequired := m.journal.Exists()
 	m.status = api.RuntimeStatus{
 		State:            api.RuntimeStateIdle,
 		Mode:             mode,
 		RequestedMode:    requested,
 		RecoveryRequired: recoveryRequired,
+	}
+	if recoveryRequired && rollbackErr != nil {
+		wrapped := api.WrapError(api.ErrCodeRecoveryFailed, "停止时恢复网络状态失败", rollbackErr)
+		m.status.LastErrorCode = wrapped.Code
+		m.status.LastErrorMessage = wrapped.Error()
 	}
 	m.companyBypassInterface = ""
 	m.companyBypassRoutes = nil
@@ -602,8 +698,16 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			health := m.forwarder.RefreshHealth(ctx)
 			m.mu.Lock()
 			m.health = health
+			mode := m.status.Mode
 			m.mu.Unlock()
 			m.emitHealth()
+			if mode == api.ModeSystem {
+				m.guardSystemProxy(ctx)
+			}
+			if !m.checkListenersAlive() {
+				m.handleDeadListeners()
+				return
+			}
 		case <-companyTicker.C:
 			m.mu.Lock()
 			companyDialer := m.companyDomainDialer
@@ -632,6 +736,86 @@ func (m *Manager) emitHealth() {
 
 func (m *Manager) emitTraffic() {
 	m.emitter.Emit(api.EventRuntimeTraffic, m.stats.Snapshot(m.status.Mode))
+}
+
+// checkListenersAlive verifies that the HTTP and SOCKS5 proxy listeners are
+// still accepting connections.  A quick TCP dial is used as the probe.
+func (m *Manager) checkListenersAlive() bool {
+	m.mu.Lock()
+	hp := m.httpProxy
+	sp := m.socks5
+	m.mu.Unlock()
+
+	if hp == nil || sp == nil {
+		return false
+	}
+
+	for _, addr := range []string{hp.Addr(), sp.Addr()} {
+		conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+	}
+	return true
+}
+
+// handleDeadListeners is called when a local proxy listener is no longer
+// reachable.  It tears down the runtime and restores the user's original
+// network state so traffic does not black-hole into a dead port.
+func (m *Manager) handleDeadListeners() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.logger.Error("runtime", "本地代理监听已失效，正在恢复网络状态", nil)
+	m.status.State = api.RuntimeStateStopping
+	m.emitStatus()
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+	m.rollbackLocked(stopCtx)
+
+	m.emitter.Emit(api.EventRuntimeError, map[string]any{
+		"message": "本地代理监听异常退出，已自动恢复网络状态",
+	})
+}
+
+// guardSystemProxy checks that the OS-level proxy settings still point to our
+// listeners.  If an external tool (Clash, V2Ray, etc.) overwrote them, we
+// re-apply ours and notify the user via an event.
+func (m *Manager) guardSystemProxy(parent context.Context) {
+	checkCtx, checkCancel := context.WithTimeout(parent, 2*time.Second)
+	defer checkCancel()
+
+	current, err := m.platform.CurrentSystemProxy(checkCtx)
+	if err != nil {
+		m.logger.Warn("runtime", "检查系统代理状态失败", map[string]any{"error": err.Error()})
+		return
+	}
+
+	expected := m.systemProxyConfig()
+	if current.Enabled &&
+		current.HTTPAddress == expected.HTTPAddress &&
+		current.HTTPSAddress == expected.HTTPSAddress {
+		return
+	}
+
+	m.logger.Warn("runtime", "系统代理被外部修改，正在自动恢复", map[string]any{
+		"expected_http":   expected.HTTPAddress,
+		"current_http":    current.HTTPAddress,
+		"current_enabled": current.Enabled,
+	})
+
+	applyCtx, applyCancel := context.WithTimeout(parent, 2*time.Second)
+	defer applyCancel()
+
+	if err := m.platform.ApplySystemProxy(applyCtx, expected); err != nil {
+		m.logger.Error("runtime", "自动恢复系统代理失败", map[string]any{"error": err.Error()})
+		return
+	}
+	m.emitter.Emit(api.EventRuntimeError, map[string]any{
+		"message": "系统代理被外部修改，已自动恢复",
+	})
 }
 
 func (m *Manager) systemProxyConfig() platform.SystemProxyConfig {

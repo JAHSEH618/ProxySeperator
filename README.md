@@ -98,6 +98,26 @@ go build -o proxyseparator ./cmd/proxyseparator
 ./proxyseparator
 ```
 
+## Automated GitHub Releases
+
+This repository includes an automated release workflow in `.github/workflows/release.yml`. When you push a tag such as `v0.1.0`, GitHub Actions will build and publish release artifacts automatically.
+
+- macOS: separate unsigned `.dmg` files for Intel (`macos-13`) and Apple Silicon (`macos-14`)
+- Windows: unsigned NSIS installer `.exe` with `wintun.dll` bundled in
+- GitHub Release: uploads all artifacts to the matching Release automatically
+
+Typical flow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Notes:
+
+- The current workflow produces unsigned packages. Add macOS signing/notarization and Windows code signing secrets when you are ready for production distribution.
+- `build/appicon.png` is still the default placeholder icon. Replace it before shipping publicly.
+
 ### Run Tests
 
 ```bash

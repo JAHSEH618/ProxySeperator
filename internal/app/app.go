@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/friedhelmliu/ProxySeperator/internal/api"
 	"github.com/friedhelmliu/ProxySeperator/internal/config"
@@ -40,6 +41,7 @@ type BackendAPI struct {
 
 	cfg             api.Config
 	onWindowRestore func()
+	debounceTimer   *time.Timer
 }
 
 func NewBackendAPI() *BackendAPI {
@@ -144,6 +146,18 @@ func (b *BackendAPI) RecoverNetwork(context.Context) error {
 	return nil
 }
 
+func (b *BackendAPI) ForceRecoverNetwork() error {
+	b.logger.Info("runtime", "收到强制恢复网络请求", nil)
+	err := b.manager.ForceRecoverNetwork()
+	defer b.restoreWindow()
+	if err != nil {
+		b.logger.Error("runtime", "强制恢复网络失败", map[string]any{"error": err.Error()})
+		return err
+	}
+	b.logger.Info("runtime", "系统网络状态已强制恢复", nil)
+	return nil
+}
+
 func (b *BackendAPI) SaveConfig(_ context.Context, cfg api.Config) error {
 	if err := validateConfig(cfg); err != nil {
 		b.logger.Warn("config", "配置校验失败", map[string]any{"error": err.Error()})
@@ -160,7 +174,31 @@ func (b *BackendAPI) SaveConfig(_ context.Context, cfg api.Config) error {
 		"rules":         len(cfg.Rules),
 		"requestedMode": configuredMode(cfg),
 	})
+
+	// If the runtime is active, schedule a debounced restart so that
+	// rapid successive config changes coalesce into a single restart.
+	if b.manager.Status().State == api.RuntimeStateRunning {
+		b.scheduleRestart()
+	}
 	return nil
+}
+
+func (b *BackendAPI) scheduleRestart() {
+	b.mu.Lock()
+	if b.debounceTimer != nil {
+		b.debounceTimer.Stop()
+	}
+	b.debounceTimer = time.AfterFunc(400*time.Millisecond, func() {
+		cfg, err := b.ensureConfig()
+		if err != nil {
+			return
+		}
+		b.logger.Info("config", "配置变更防抖触发，正在重启运行时", nil)
+		if _, err := b.manager.Restart(cfg); err != nil {
+			b.logger.Warn("config", "防抖重启失败", map[string]any{"error": err.Error()})
+		}
+	})
+	b.mu.Unlock()
 }
 
 func (b *BackendAPI) Start(ctx context.Context) (api.RuntimeStatus, error) {

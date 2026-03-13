@@ -98,6 +98,26 @@ go build -o proxyseparator ./cmd/proxyseparator
 ./proxyseparator
 ```
 
+## GitHub 自动 Release
+
+仓库现在已经包含自动发布工作流 `.github/workflows/release.yml`。当你推送类似 `v0.1.0` 的 tag 时，GitHub Actions 会自动构建并发布 Release 产物。
+
+- macOS：分别产出 Intel (`macos-13`) 和 Apple Silicon (`macos-14`) 的未签名 `.dmg`
+- Windows：产出未签名的 NSIS 安装包 `.exe`，并把 `wintun.dll` 一起打进去
+- GitHub Release：工作流会自动把这些产物上传到对应 Release
+
+典型用法：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+补充说明：
+
+- 当前工作流默认生成“未签名”安装包。如果后面要正式分发，再补 macOS 签名/公证和 Windows 代码签名 secrets。
+- `build/appicon.png` 现在还是默认占位图，正式发版前建议替换成你自己的应用图标。
+
 ### 运行测试
 
 ```bash

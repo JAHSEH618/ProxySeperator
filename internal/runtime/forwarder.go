@@ -23,21 +23,32 @@ type Forwarder struct {
 	stats    *StatsTracker
 	dnsCache *localdns.Cache
 
-	mu             sync.RWMutex
-	matcher        *rules.Matcher
-	companyDialer  companyDialPreparer
-	personalConfig api.UpstreamConfig
-	health         api.HealthStatus
+	mu               sync.RWMutex
+	matcher          *rules.Matcher
+	companyDialer    companyDialPreparer
+	personalConfig   api.UpstreamConfig
+	health           api.HealthStatus
+	failOpenDirect   bool
+	personalDegraded bool
+	emitEvent        func(string, any)
 }
 
 func NewForwarder(cfg api.Config, matcher *rules.Matcher, dnsCache *localdns.Cache, stats *StatsTracker, logger *logging.Logger) *Forwarder {
+	failOpen := cfg.Advanced.FailOpenDirect == nil || *cfg.Advanced.FailOpenDirect
 	return &Forwarder{
 		logger:         logger,
 		stats:          stats,
 		dnsCache:       dnsCache,
 		matcher:        matcher,
 		personalConfig: cfg.PersonalUpstream,
+		failOpenDirect: failOpen,
 	}
+}
+
+func (f *Forwarder) SetEventEmitter(fn func(string, any)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.emitEvent = fn
 }
 
 func (f *Forwarder) RefreshHealth(ctx context.Context) api.HealthStatus {
@@ -50,7 +61,17 @@ func (f *Forwarder) RefreshHealth(ctx context.Context) api.HealthStatus {
 	}
 	f.mu.Lock()
 	f.health = status
+	wasDegraded := f.personalDegraded
+	if personal.Reachable && f.personalDegraded {
+		f.personalDegraded = false
+	}
+	emitFn := f.emitEvent
 	f.mu.Unlock()
+	if wasDegraded && personal.Reachable && emitFn != nil {
+		emitFn(api.EventRuntimeError, map[string]any{
+			"message": "个人代理已恢复，切回正常路由",
+		})
+	}
 	return status
 }
 
@@ -92,12 +113,36 @@ func (f *Forwarder) DialTarget(ctx context.Context, network, addr string) (net.C
 	default:
 		target = api.RouteTargetPersonal
 		conn, err = f.dialViaUpstream(ctx, f.personalConfig, addr)
+		if err != nil && f.failOpenDirect {
+			f.logger.Warn("runtime.forwarder", "个人代理拨号失败，降级直连", map[string]any{
+				"target": addr,
+				"error":  err.Error(),
+			})
+			conn, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+			if err == nil {
+				target = api.RouteTargetDirect
+				f.notifyDegraded()
+			}
+		}
 	}
 	if err != nil {
 		return nil, target, err
 	}
 	f.stats.SessionStarted()
 	return &trackedConn{Conn: conn, target: target, stats: f.stats}, target, nil
+}
+
+func (f *Forwarder) notifyDegraded() {
+	f.mu.Lock()
+	alreadyDegraded := f.personalDegraded
+	f.personalDegraded = true
+	emitFn := f.emitEvent
+	f.mu.Unlock()
+	if !alreadyDegraded && emitFn != nil {
+		emitFn(api.EventRuntimeError, map[string]any{
+			"message": "个人代理不可达，已临时切换为直连",
+		})
+	}
 }
 
 func (f *Forwarder) dialCompanyTarget(ctx context.Context, network, addr string) (net.Conn, error) {

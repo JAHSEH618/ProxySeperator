@@ -71,6 +71,7 @@ type AdvancedConfig struct {
 	BypassChinaIP   bool   `json:"bypassChinaIP"`
 	AutoStart       bool   `json:"autoStart"`
 	StartMinimized  bool   `json:"startMinimized"`
+	FailOpenDirect  *bool  `json:"failOpenDirect,omitempty"` // nil defaults to true
 }
 
 type UIConfig struct {

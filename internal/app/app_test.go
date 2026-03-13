@@ -14,6 +14,7 @@ type fakePlatformController struct {
 	applied       bool
 	cleared       bool
 	bypassCleared bool
+	recoverCalled bool
 }
 
 func (f *fakePlatformController) ApplySystemProxy(context.Context, platform.SystemProxyConfig) error {
@@ -51,6 +52,7 @@ func (f *fakePlatformController) CaptureRecoverySnapshot(context.Context, string
 	return api.RecoverySnapshot{Platform: "test"}, nil
 }
 func (f *fakePlatformController) RecoverNetwork(context.Context, api.RecoverySnapshot) error {
+	f.recoverCalled = true
 	return nil
 }
 func (f *fakePlatformController) DefaultEgressInterface(context.Context) (string, error) {
@@ -94,7 +96,10 @@ func TestOnShutdownStopsRunningRuntime(t *testing.T) {
 	if err := service.OnShutdown(context.Background()); err != nil {
 		t.Fatalf("shutdown failed: %v", err)
 	}
-	if !controller.cleared {
-		t.Fatal("expected system proxy to be cleared on shutdown")
+	if !controller.recoverCalled {
+		t.Fatal("expected shutdown to restore network from recovery snapshot")
+	}
+	if controller.cleared {
+		t.Fatal("expected shutdown not to fall back to clearing system proxy when snapshot restore succeeds")
 	}
 }

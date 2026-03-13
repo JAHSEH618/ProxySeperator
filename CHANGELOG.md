@@ -1,5 +1,33 @@
 # Changelog
 
+## [2026-03-13] - `unreleased`
+
+### Fixed
+- 修复正常 Stop 时直接清空系统代理而非恢复用户原始代理状态的问题，改为优先从恢复快照还原，失败才降级到基础清理。
+- 修复 Stop 恢复快照失败后错误信息被无条件清空、用户无法在 UI 看到失败原因的问题。
+
+### Changed
+- 移除 `rollbackLocked` 已废弃的 `clearJournal` 参数，简化所有调用方。
+- Start 中途失败的回滚路径现在也优先使用恢复快照还原网络状态，与 Stop 行为一致。
+- `rollbackLocked` 每个清理步骤改为独立超时（DNS/代理清除 2s、TUN/快照恢复 5s），防止单步阻塞导致后续清理全部失败。
+- macOS `ApplySystemProxy` 改为逐服务尝试，部分失败时跳过并继续，仅全部失败才报错。
+- `SaveConfig` 在运行时活跃期间自动触发 400ms 防抖重启，快速连续变更只产生一次实际重启。
+- 托盘标签根据运行状态动态显示模式（System/TUN）或空闲/异常状态。
+
+### Added
+- 新增 Start 失败后 rollback 走快照恢复路径的测试覆盖。
+- 新增 Stop 恢复失败时错误码与错误消息保留的断言。
+- 集成 Wails 3 构建系统，添加开发和生产环境资源文件系统实现（`appassets_dev.go`/`appassets_production.go`）。
+- 配置 macOS 和 Windows 平台的 Taskfile 任务定义，支持一键构建、打包和分发。
+- 新增 GitHub Actions 自动发布工作流，支持 macOS（amd64/arm64）和 Windows（amd64）多架构构建。
+- 配置 NSIS 安装包模板用于 Windows 平台分发。
+- 新增托盘"Repair Network"紧急按钮，无需打开主窗口即可强制恢复网络状态，运行中也可使用。
+- 新增系统代理守护（Proxy Guard），运行中每 5s 校验系统代理是否被外部工具篡改，发现异常自动恢复并通知前端。
+- 新增个人代理不可达时降级直连（Fail-Open），通过 `failOpenDirect` 配置开关控制（默认开启），恢复后自动切回；降级和恢复均推送事件通知前端。
+- 新增系统代理守护、降级直连及通知去重的测试覆盖。
+- 新增本地代理监听存活检测，运行中每 5s 探测 HTTP/SOCKS5 端口，失效时自动恢复网络状态并通知前端。
+- 新增单实例保护，通过绑定固定端口 `:17899` 防止多实例同时运行；重复启动时自动激活已有窗口。开发模式可通过 `PROXYSEPARATOR_ALLOW_MULTI_INSTANCE` 环境变量跳过。
+
 ## [2026-03-12] - `unreleased`
 
 ### Fixed
