@@ -13,23 +13,26 @@ import (
 )
 
 type fakePlatform struct {
-	applied           bool
-	cleared           bool
-	bypassInterface   string
-	bypassRoutes      []string
-	clearedBypass     []string
-	systemProxy       api.SystemProxyState
-	defaultEgress     string
-	validateTUNErr    error
-	defaultEgressErr  error
-	recoverCalled     bool
-	recoverErr        error
-	capturedSnapshots []api.RecoverySnapshot
+	applied              bool
+	cleared              bool
+	stopTUNCalled        bool
+	bypassInterface      string
+	bypassRoutes         []string
+	clearedBypass        []string
+	recoveredSnapshot    api.RecoverySnapshot
+	systemProxy          api.SystemProxyState
+	defaultEgress        string
+	validateTUNErr       error
+	defaultEgressErr     error
+	applySystemProxyErr  error
+	recoverCalled        bool
+	recoverErr           error
+	capturedSnapshots    []api.RecoverySnapshot
 }
 
 func (f *fakePlatform) ApplySystemProxy(context.Context, platform.SystemProxyConfig) error {
 	f.applied = true
-	return nil
+	return f.applySystemProxyErr
 }
 
 func (f *fakePlatform) ClearSystemProxy(context.Context) error {
@@ -71,8 +74,12 @@ func (f *fakePlatform) CaptureRecoverySnapshot(context.Context, string) (api.Rec
 	f.capturedSnapshots = append(f.capturedSnapshots, snapshot)
 	return snapshot, nil
 }
-func (f *fakePlatform) RecoverNetwork(context.Context, api.RecoverySnapshot) error {
+func (f *fakePlatform) RecoverNetwork(_ context.Context, snapshot api.RecoverySnapshot) error {
 	f.recoverCalled = true
+	f.recoveredSnapshot = snapshot
+	if snapshot.CompanyBypass.Interface != "" && len(snapshot.CompanyBypass.Routes) > 0 {
+		f.clearedBypass = append([]string(nil), snapshot.CompanyBypass.Routes...)
+	}
 	return f.recoverErr
 }
 func (f *fakePlatform) DefaultEgressInterface(context.Context) (string, error) {
@@ -88,14 +95,25 @@ func (f *fakePlatform) ValidateTUN(context.Context) error {
 	return f.validateTUNErr
 }
 func (f *fakePlatform) StartTUN(context.Context, platform.TUNOptions) error { return nil }
-func (f *fakePlatform) StopTUN(context.Context) error                       { return nil }
+func (f *fakePlatform) StopTUN(context.Context) error {
+	f.stopTUNCalled = true
+	return nil
+}
 
 func TestManagerStartStopSystemMode(t *testing.T) {
 	companyStub := startSOCKS5Stub(t)
 	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
 
 	logger := logging.NewLogger(logging.NewRingBuffer(50))
-	controller := &fakePlatform{}
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+	}
 	manager := NewManagerWithOptions(logger, nil, Options{
 		Platform:            controller,
 		HTTPListenAddr:      "127.0.0.1:0",
@@ -107,7 +125,7 @@ func TestManagerStartStopSystemMode(t *testing.T) {
 	cfg := api.DefaultConfig()
 	cfg.Advanced.Mode = api.ModeSystem
 	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
-	cfg.PersonalUpstream = upstreamFromAddress(t, personalStub)
+	cfg.PersonalUpstream = personalUpstream
 
 	status, err := manager.Start(cfg)
 	if err != nil {
@@ -123,8 +141,70 @@ func TestManagerStartStopSystemMode(t *testing.T) {
 	if err := manager.Stop(); err != nil {
 		t.Fatalf("stop failed: %v", err)
 	}
+	if !controller.recoverCalled {
+		t.Fatal("expected stop to restore network from recovery snapshot")
+	}
+	if controller.cleared {
+		t.Fatal("expected stop not to fall back to clearing system proxy when snapshot restore succeeds")
+	}
+	if manager.journal.Exists() {
+		t.Fatal("expected recovery journal to be removed after successful stop restore")
+	}
+}
+
+func TestManagerStopFallsBackToClearSystemProxyWhenSnapshotRecoveryFails(t *testing.T) {
+	companyStub := startSOCKS5Stub(t)
+	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+		recoverErr: api.NewError(api.ErrCodeRecoveryFailed, "restore failed"),
+	}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
+	cfg.PersonalUpstream = personalUpstream
+
+	if _, err := manager.Start(cfg); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	if err := manager.Stop(); err != nil {
+		t.Fatalf("stop failed: %v", err)
+	}
+	if !controller.recoverCalled {
+		t.Fatal("expected stop to attempt snapshot recovery before falling back")
+	}
 	if !controller.cleared {
-		t.Fatal("expected system proxy to be cleared")
+		t.Fatal("expected stop to fall back to clearing system proxy when snapshot recovery fails")
+	}
+	if !manager.journal.Exists() {
+		t.Fatal("expected recovery journal to be preserved after failed snapshot restore")
+	}
+	if !manager.Status().RecoveryRequired {
+		t.Fatal("expected runtime status to require recovery after failed snapshot restore")
+	}
+	status := manager.Status()
+	if status.LastErrorCode == "" {
+		t.Fatal("expected error code to be preserved when snapshot recovery fails during stop")
+	}
+	if status.LastErrorMessage == "" {
+		t.Fatal("expected error message to be preserved when snapshot recovery fails during stop")
 	}
 }
 
@@ -167,6 +247,87 @@ func TestManagerStartStopSystemModeWithPersonalTUNAppliesCompanyBypassRoutes(t *
 	}
 	if len(controller.clearedBypass) == 0 {
 		t.Fatal("expected company bypass routes to be cleared")
+	}
+}
+
+func TestManagerStopRestoresTUNSnapshotInsteadOfStoppingTUNDirectly(t *testing.T) {
+	companyStub := startSOCKS5Stub(t)
+	personalStub := startSOCKS5Stub(t)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeTUN
+	cfg.Advanced.TUNEnabled = true
+	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
+	cfg.PersonalUpstream = upstreamFromAddress(t, personalStub)
+
+	if _, err := manager.Start(cfg); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	if err := manager.Stop(); err != nil {
+		t.Fatalf("stop failed: %v", err)
+	}
+	if !controller.recoverCalled {
+		t.Fatal("expected TUN stop to restore network from recovery snapshot")
+	}
+	if controller.stopTUNCalled {
+		t.Fatal("expected TUN stop not to fall back to StopTUN when snapshot restore succeeds")
+	}
+}
+
+func TestManagerStartFailureAfterJournalUsesSnapshotRollback(t *testing.T) {
+	companyStub := startSOCKS5Stub(t)
+	personalStub := startSOCKS5Stub(t)
+	personalUpstream := upstreamFromAddress(t, personalStub)
+
+	logger := logging.NewLogger(logging.NewRingBuffer(50))
+	controller := &fakePlatform{
+		systemProxy: api.SystemProxyState{
+			Enabled:      true,
+			HTTPAddress:  personalUpstream.Address(),
+			HTTPSAddress: personalUpstream.Address(),
+			SOCKSAddress: personalUpstream.Address(),
+		},
+		applySystemProxyErr: api.NewError(api.ErrCodeSystemProxyFailed, "apply failed"),
+	}
+	manager := NewManagerWithOptions(logger, nil, Options{
+		Platform:            controller,
+		HTTPListenAddr:      "127.0.0.1:0",
+		SOCKSListenAddr:     "127.0.0.1:0",
+		DNSListenAddr:       "127.0.0.1:0",
+		RecoveryJournalPath: t.TempDir() + "/recovery.json",
+	})
+
+	cfg := api.DefaultConfig()
+	cfg.Advanced.Mode = api.ModeSystem
+	cfg.CompanyUpstream = upstreamFromAddress(t, companyStub)
+	cfg.PersonalUpstream = personalUpstream
+
+	_, err := manager.Start(cfg)
+	if err == nil {
+		t.Fatal("expected start to fail when ApplySystemProxy fails")
+	}
+	if !controller.recoverCalled {
+		t.Fatal("expected rollback to use journal snapshot recovery")
+	}
+	if controller.cleared {
+		t.Fatal("expected rollback not to fall back to ClearSystemProxy when snapshot restore succeeds")
+	}
+	if manager.journal.Exists() {
+		t.Fatal("expected journal to be removed after successful snapshot rollback")
+	}
+	if manager.Status().State != api.RuntimeStateIdle {
+		t.Fatalf("expected idle state after failed start, got %s", manager.Status().State)
 	}
 }
 

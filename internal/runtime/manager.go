@@ -258,14 +258,14 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 
 	m.stats.Start(report.EffectiveMode)
 	if err := m.httpProxy.Start(runCtx); err != nil {
-		m.rollbackLocked(runCtx, false)
+		m.rollbackLocked(runCtx)
 		m.status.LastErrorCode = api.ErrorCode(err)
 		m.status.LastErrorMessage = err.Error()
 		m.emitStatus()
 		return m.status, err
 	}
 	if err := m.socks5.Start(runCtx); err != nil {
-		m.rollbackLocked(runCtx, false)
+		m.rollbackLocked(runCtx)
 		m.status.LastErrorCode = api.ErrorCode(err)
 		m.status.LastErrorMessage = err.Error()
 		m.emitStatus()
@@ -274,7 +274,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 
 	if report.EffectiveMode == api.ModeTUN {
 		if err := m.dns.Start(); err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			wrapped := api.WrapError(api.ErrCodeRuntimeStartFailed, "启动本地 DNS 失败", err)
 			m.status.LastErrorCode = wrapped.Code
 			m.status.LastErrorMessage = wrapped.Error()
@@ -283,7 +283,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		}
 		egress, err := m.platform.DefaultEgressInterface(runCtx)
 		if err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			wrapped := api.WrapError(api.ErrCodeTUNUnavailable, "无法识别默认出口接口", err)
 			m.status.LastErrorCode = wrapped.Code
 			m.status.LastErrorMessage = wrapped.Error()
@@ -296,7 +296,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			EgressInterface:    egress,
 			MTU:                1500,
 		}); err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			m.status.LastErrorCode = api.ErrorCode(err)
 			m.status.LastErrorMessage = err.Error()
 			m.emitStatus()
@@ -304,7 +304,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		}
 		if snapshot.SystemProxy.Enabled {
 			if err := m.platform.ClearSystemProxy(runCtx); err != nil {
-				m.rollbackLocked(runCtx, false)
+				m.rollbackLocked(runCtx)
 				wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "切换到 TUN 模式前清理系统代理失败", err)
 				m.status.LastErrorCode = wrapped.Code
 				m.status.LastErrorMessage = wrapped.Error()
@@ -324,7 +324,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			if len(bypassRoutes) > 0 {
 				iface, err := m.platform.PreferredCompanyBypassInterface(runCtx)
 				if err != nil {
-					m.rollbackLocked(runCtx, false)
+					m.rollbackLocked(runCtx)
 					wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "无法识别公司旁路接口", err)
 					m.status.LastErrorCode = wrapped.Code
 					m.status.LastErrorMessage = wrapped.Error()
@@ -332,7 +332,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 					return m.status, wrapped
 				}
 				if err := m.platform.ApplyCompanyBypassRoutes(runCtx, iface, bypassRoutes); err != nil {
-					m.rollbackLocked(runCtx, false)
+					m.rollbackLocked(runCtx)
 					m.status.LastErrorCode = api.ErrorCode(err)
 					m.status.LastErrorMessage = err.Error()
 					m.emitStatus()
@@ -377,7 +377,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 			m.forwarder.SetCompanyDialPreparer(m.companyDomainDialer)
 		}
 		if err := m.platform.ApplySystemProxy(runCtx, m.systemProxyConfig()); err != nil {
-			m.rollbackLocked(runCtx, false)
+			m.rollbackLocked(runCtx)
 			m.status.LastErrorCode = api.ErrorCode(err)
 			m.status.LastErrorMessage = err.Error()
 			m.emitStatus()
@@ -418,9 +418,11 @@ func (m *Manager) Stop() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	m.rollbackLocked(ctx, true)
-	m.status.LastErrorCode = ""
-	m.status.LastErrorMessage = ""
+	m.rollbackLocked(ctx)
+	if !m.status.RecoveryRequired {
+		m.status.LastErrorCode = ""
+		m.status.LastErrorMessage = ""
+	}
 	return nil
 }
 
@@ -537,7 +539,7 @@ func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (boo
 	return true, nil
 }
 
-func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {
+func (m *Manager) rollbackLocked(ctx context.Context) {
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
@@ -550,12 +552,39 @@ func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {
 		_ = m.socks5.Stop()
 		m.socks5 = nil
 	}
-	if m.status.Mode == api.ModeTUN {
-		if m.dns != nil {
-			_ = m.dns.Stop(ctx)
+
+	if m.dns != nil {
+		_ = m.dns.Stop(ctx)
+	}
+
+	recoveredFromJournal := false
+	var rollbackErr error
+	if m.journal.Exists() {
+		snapshot, err := m.journal.Load()
+		if err != nil {
+			rollbackErr = err
+			m.logger.Warn("runtime", "读取恢复快照失败，回退到基础网络清理", map[string]any{
+				"error": err.Error(),
+			})
+		} else if err := m.platform.RecoverNetwork(ctx, snapshot); err != nil {
+			rollbackErr = err
+			m.logger.Warn("runtime", "按恢复快照还原网络失败，回退到基础网络清理", map[string]any{
+				"error": err.Error(),
+				"mode":  snapshot.Mode,
+			})
+		} else {
+			recoveredFromJournal = true
+			if err := m.journal.Remove(); err != nil {
+				m.logger.Warn("runtime", "删除恢复快照失败", map[string]any{
+					"error": err.Error(),
+				})
+			}
 		}
+	}
+
+	if !recoveredFromJournal && m.status.Mode == api.ModeTUN {
 		_ = m.platform.StopTUN(ctx)
-	} else {
+	} else if !recoveredFromJournal {
 		routes := append([]string(nil), m.companyBypassRoutes...)
 		if m.companyDomainDialer != nil {
 			routes = mergeRouteLists(routes, m.companyDomainDialer.DynamicRoutes())
@@ -565,20 +594,23 @@ func (m *Manager) rollbackLocked(ctx context.Context, clearJournal bool) {
 		}
 		_ = m.platform.ClearSystemProxy(ctx)
 	}
+
 	m.dns = nil
 	m.dnsCache.Clear()
 	m.stats.Stop()
-	if clearJournal {
-		_ = m.journal.Remove()
-	}
 	mode := m.status.Mode
 	requested := m.status.RequestedMode
-	recoveryRequired := clearJournal && m.journal.Exists()
+	recoveryRequired := m.journal.Exists()
 	m.status = api.RuntimeStatus{
 		State:            api.RuntimeStateIdle,
 		Mode:             mode,
 		RequestedMode:    requested,
 		RecoveryRequired: recoveryRequired,
+	}
+	if recoveryRequired && rollbackErr != nil {
+		wrapped := api.WrapError(api.ErrCodeRecoveryFailed, "停止时恢复网络状态失败", rollbackErr)
+		m.status.LastErrorCode = wrapped.Code
+		m.status.LastErrorMessage = wrapped.Error()
 	}
 	m.companyBypassInterface = ""
 	m.companyBypassRoutes = nil

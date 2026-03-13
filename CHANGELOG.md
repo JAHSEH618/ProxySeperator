@@ -1,5 +1,19 @@
 # Changelog
 
+## [2026-03-13] - `unreleased`
+
+### Fixed
+- 修复正常 Stop 时直接清空系统代理而非恢复用户原始代理状态的问题，改为优先从恢复快照还原，失败才降级到基础清理。
+- 修复 Stop 恢复快照失败后错误信息被无条件清空、用户无法在 UI 看到失败原因的问题。
+
+### Changed
+- 移除 `rollbackLocked` 已废弃的 `clearJournal` 参数，简化所有调用方。
+- Start 中途失败的回滚路径现在也优先使用恢复快照还原网络状态，与 Stop 行为一致。
+
+### Added
+- 新增 Start 失败后 rollback 走快照恢复路径的测试覆盖。
+- 新增 Stop 恢复失败时错误码与错误消息保留的断言。
+
 ## [2026-03-12] - `unreleased`
 
 ### Fixed
