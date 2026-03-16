@@ -12,7 +12,7 @@ tasks:
       - task: common:generate:icons
     cmds:
       - task: generate:syso
-      - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}}.exe
+      - go build {{.BUILD_FLAGS}} -o {{.BIN_DIR}}/{{.APP_NAME}}.exe ./cmd/proxyseparator
       - cmd: powershell Remove-Item *.syso
         platforms: [windows]
       - cmd: rm -f *.syso

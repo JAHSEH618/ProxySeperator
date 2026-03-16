@@ -11,7 +11,7 @@ tasks:
       - task: common:build:frontend
       - task: common:generate:icons
     cmds:
-      - go build {{.BUILD_FLAGS}} -o {{.OUTPUT}}
+      - go build {{.BUILD_FLAGS}} -o {{.OUTPUT}} ./cmd/proxyseparator
     vars:
       BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production -trimpath -buildvcs=false -ldflags="-w -s"{{else}}-buildvcs=false -gcflags=all="-l"{{end}}'
       DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
