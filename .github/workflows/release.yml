@@ -12,6 +12,7 @@ env:
   APP_NAME: ProxySeparator
   WAILS_VERSION: v3.0.0-alpha.64
   WINTUN_URL: https://www.wintun.net/builds/wintun-0.14.1.zip
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-macos:
@@ -67,7 +68,8 @@ jobs:
           wails3 task darwin:create:dmg ARCH=${{ matrix.arch }}
           mkdir -p release-assets
           VERSION="${GITHUB_REF_NAME#v}"
-          mv "bin/${APP_NAME}.dmg" "release-assets/${APP_NAME}-${VERSION}-macos-${{ matrix.label }}.dmg"
+          ASSET_NAME="${APP_NAME}-${VERSION}-macos-${{ matrix.label }}.dmg"
+          mv "bin/${APP_NAME}.dmg" "release-assets/${ASSET_NAME}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -140,12 +142,31 @@ jobs:
         run: go test ./...
 
       - name: Build installer
-        shell: bash
+        shell: pwsh
         run: |
           wails3 task windows:package ARCH=${{ matrix.arch }}
-          mkdir -p release-assets
-          VERSION="${GITHUB_REF_NAME#v}"
-          mv "bin/${APP_NAME}-${{ matrix.arch }}-installer.exe" "release-assets/${APP_NAME}-${VERSION}-windows-${{ matrix.label }}-setup.exe"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $assetName = "$env:APP_NAME-$version-windows-${{ matrix.label }}-setup.exe"
+          $exactInstallerPath = Join-Path "bin" "$env:APP_NAME-${{ matrix.arch }}-installer.exe"
+
+          if (Test-Path -LiteralPath $exactInstallerPath) {
+            $installer = Get-Item -LiteralPath $exactInstallerPath
+          } else {
+            $candidates = @(Get-ChildItem -Path bin -Filter "$env:APP_NAME-*-installer.exe")
+
+            if ($candidates.Count -ne 1) {
+              throw "Expected one installer for architecture ${{ matrix.arch }}, found $($candidates.Count)."
+            }
+
+            $installer = $candidates[0]
+          }
+
+          if (-not $installer) {
+            throw "Installer not found under bin/ for architecture ${{ matrix.arch }}."
+          }
+
+          Move-Item -LiteralPath $installer.FullName -Destination (Join-Path "release-assets" $assetName)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
