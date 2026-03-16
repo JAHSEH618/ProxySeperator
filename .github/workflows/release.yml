@@ -24,7 +24,7 @@ jobs:
         include:
           - runner: macos-15
             arch: amd64
-            label: amd64
+            label: x86_64
           - runner: macos-15
             arch: arm64
             label: arm64
@@ -85,7 +85,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            label: amd64
+            label: x86_64
           - arch: arm64
             label: arm64
 
