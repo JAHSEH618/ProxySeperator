@@ -36,15 +36,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -75,17 +75,17 @@ jobs:
           DMG_NAME="${APP_NAME}-${VERSION}-macos-${{ matrix.label }}"
           wails3 task darwin:create:dmg ARCH="${ARCH}" APP_BUNDLE_NAME="${APP_BUNDLE_NAME}" DMG_NAME="${DMG_NAME}" DMG_VOLUME_NAME="${APP_BUNDLE_NAME}"
           echo "Runner architecture: $(uname -m)"
-          ACTUAL_ARCHS="$(lipo -archs "bin/${APP_BUNDLE_NAME}.app/Contents/MacOS/${APP_NAME}")"
-          echo "Binary architectures: ${ACTUAL_ARCHS}"
-          if [[ " ${ACTUAL_ARCHS} " != *" ${{ matrix.macho_arch }} "* ]]; then
-            echo "Expected macOS binary architecture '${{ matrix.macho_arch }}' but got '${ACTUAL_ARCHS}'."
+          BINARY_INFO="$(file -b "bin/${APP_BUNDLE_NAME}.app/Contents/MacOS/${APP_NAME}")"
+          echo "Binary info: ${BINARY_INFO}"
+          if [[ "${BINARY_INFO}" != *"${{ matrix.macho_arch }}"* ]]; then
+            echo "Expected macOS binary architecture '${{ matrix.macho_arch }}' but got '${BINARY_INFO}'."
             exit 1
           fi
           mkdir -p release-assets
           mv "bin/${DMG_NAME}.dmg" "release-assets/${DMG_NAME}.dmg"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: macos-${{ matrix.label }}
           path: release-assets/*
@@ -106,15 +106,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -184,7 +184,7 @@ jobs:
           Move-Item -LiteralPath $installer.FullName -Destination (Join-Path "release-assets" $assetName)
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-${{ matrix.label }}
           path: release-assets/*
@@ -200,7 +200,7 @@ jobs:
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: release-assets
 
