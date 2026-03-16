@@ -76,8 +76,16 @@ jobs:
           path: release-assets/*
 
   build-windows:
-    name: Build Windows (amd64)
+    name: Build Windows (${{ matrix.label }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            label: amd64
+          - arch: arm64
+            label: arm64
 
     steps:
       - name: Checkout
@@ -113,9 +121,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path build/windows | Out-Null
           Invoke-WebRequest -Uri $env:WINTUN_URL -OutFile wintun.zip
           Expand-Archive -LiteralPath wintun.zip -DestinationPath wintun
-          $dll = Get-ChildItem -Path wintun -Recurse -Filter wintun.dll | Where-Object { $_.FullName -match 'amd64' } | Select-Object -First 1
+          $dll = Get-ChildItem -Path wintun -Recurse -Filter wintun.dll | Where-Object { $_.FullName -match '${{ matrix.arch }}' } | Select-Object -First 1
           if (-not $dll) {
-            throw "wintun.dll for amd64 was not found in the downloaded archive."
+            throw "wintun.dll for ${{ matrix.arch }} was not found in the downloaded archive."
           }
           Copy-Item $dll.FullName build/windows/wintun.dll
 
@@ -127,21 +135,22 @@ jobs:
           rm build/config.yml.bak
 
       - name: Run tests
+        if: matrix.arch == 'amd64'
         shell: bash
         run: go test ./...
 
       - name: Build installer
         shell: bash
         run: |
-          wails3 task windows:package
+          wails3 task windows:package ARCH=${{ matrix.arch }}
           mkdir -p release-assets
           VERSION="${GITHUB_REF_NAME#v}"
-          mv "bin/${APP_NAME}-amd64-installer.exe" "release-assets/${APP_NAME}-${VERSION}-windows-amd64-setup.exe"
+          mv "bin/${APP_NAME}-${{ matrix.arch }}-installer.exe" "release-assets/${APP_NAME}-${VERSION}-windows-${{ matrix.label }}-setup.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-amd64
+          name: windows-${{ matrix.label }}
           path: release-assets/*
 
   publish-release:
