@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-15-intel
             arch: amd64
             label: x86_64
           - runner: macos-15
@@ -65,11 +65,14 @@ jobs:
       - name: Build DMG
         shell: bash
         run: |
-          wails3 task darwin:create:dmg ARCH=${{ matrix.arch }}
-          mkdir -p release-assets
           VERSION="${GITHUB_REF_NAME#v}"
-          ASSET_NAME="${APP_NAME}-${VERSION}-macos-${{ matrix.label }}.dmg"
-          mv "bin/${APP_NAME}.dmg" "release-assets/${ASSET_NAME}"
+          APP_BUNDLE_NAME="${APP_NAME}-${{ matrix.label }}"
+          DMG_NAME="${APP_NAME}-${VERSION}-macos-${{ matrix.label }}"
+          wails3 task darwin:create:dmg ARCH=${{ matrix.arch }} APP_BUNDLE_NAME="${APP_BUNDLE_NAME}" DMG_NAME="${DMG_NAME}" DMG_VOLUME_NAME="${APP_BUNDLE_NAME}"
+          echo "Runner architecture: $(uname -m)"
+          file "bin/${APP_BUNDLE_NAME}.app/Contents/MacOS/${APP_NAME}"
+          mkdir -p release-assets
+          mv "bin/${DMG_NAME}.dmg" "release-assets/${DMG_NAME}.dmg"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

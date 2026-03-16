@@ -37,14 +37,19 @@ tasks:
           PRODUCTION: 'true'
     cmds:
       - task: create:app:bundle
+        vars:
+          APP_BUNDLE_NAME: '{{.APP_BUNDLE_NAME | default .APP_NAME}}'
 
   create:app:bundle:
     summary: Creates an `.app` bundle
+    vars:
+      APP_BUNDLE_NAME: '{{.APP_BUNDLE_NAME | default .APP_NAME}}'
     cmds:
-      - mkdir -p {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/{MacOS,Resources}
-      - cp build/darwin/icons.icns {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources
-      - cp {{.BIN_DIR}}/{{.APP_NAME}} {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS
-      - cp build/darwin/Info.plist {{.BIN_DIR}}/{{.APP_NAME}}.app/Contents
+      - rm -rf {{.BIN_DIR}}/{{.APP_BUNDLE_NAME}}.app
+      - mkdir -p {{.BIN_DIR}}/{{.APP_BUNDLE_NAME}}.app/Contents/{MacOS,Resources}
+      - cp build/darwin/icons.icns {{.BIN_DIR}}/{{.APP_BUNDLE_NAME}}.app/Contents/Resources
+      - cp {{.BIN_DIR}}/{{.APP_NAME}} {{.BIN_DIR}}/{{.APP_BUNDLE_NAME}}.app/Contents/MacOS
+      - cp build/darwin/Info.plist {{.BIN_DIR}}/{{.APP_BUNDLE_NAME}}.app/Contents
 
   create:dmg:
     summary: Creates a `.dmg` archive for distribution
@@ -52,12 +57,18 @@ tasks:
       - darwin
     deps:
       - task: package
+        vars:
+          APP_BUNDLE_NAME: '{{.APP_BUNDLE_NAME | default .APP_NAME}}'
+    vars:
+      APP_BUNDLE_NAME: '{{.APP_BUNDLE_NAME | default .APP_NAME}}'
+      DMG_NAME: '{{.DMG_NAME | default .APP_NAME}}'
+      DMG_VOLUME_NAME: '{{.DMG_VOLUME_NAME | default .APP_BUNDLE_NAME}}'
     cmds:
-      - rm -f {{.BIN_DIR}}/{{.APP_NAME}}.dmg
+      - rm -f {{.BIN_DIR}}/{{.DMG_NAME}}.dmg
       - rm -rf {{.BIN_DIR}}/.dmg-root
       - mkdir -p {{.BIN_DIR}}/.dmg-root
-      - cp -R {{.BIN_DIR}}/{{.APP_NAME}}.app {{.BIN_DIR}}/.dmg-root/
-      - hdiutil create -volname {{.APP_NAME}} -srcfolder {{.BIN_DIR}}/.dmg-root -ov -format UDZO {{.BIN_DIR}}/{{.APP_NAME}}.dmg
+      - cp -R {{.BIN_DIR}}/{{.APP_BUNDLE_NAME}}.app {{.BIN_DIR}}/.dmg-root/
+      - hdiutil create -volname {{.DMG_VOLUME_NAME}} -srcfolder {{.BIN_DIR}}/.dmg-root -ov -format UDZO {{.BIN_DIR}}/{{.DMG_NAME}}.dmg
       - rm -rf {{.BIN_DIR}}/.dmg-root
 
   run:
