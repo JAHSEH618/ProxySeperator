@@ -34,6 +34,7 @@ tasks:
       - task: common:update:build-assets
       - task: build
         vars:
+          ARCH: '{{.ARCH | default ARCH}}'
           PRODUCTION: 'true'
     cmds:
       - task: create:app:bundle
@@ -58,6 +59,7 @@ tasks:
     deps:
       - task: package
         vars:
+          ARCH: '{{.ARCH | default ARCH}}'
           APP_BUNDLE_NAME: '{{.APP_BUNDLE_NAME | default .APP_NAME}}'
     vars:
       APP_BUNDLE_NAME: '{{.APP_BUNDLE_NAME | default .APP_NAME}}'
