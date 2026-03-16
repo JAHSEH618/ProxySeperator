@@ -67,20 +67,56 @@ jobs:
         shell: bash
         run: go test ./...
 
+      - name: Update build assets
+        shell: bash
+        run: wails3 task common:update:build-assets
+
       - name: Build DMG
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           APP_BUNDLE_NAME="${APP_NAME}-${{ matrix.label }}"
           DMG_NAME="${APP_NAME}-${VERSION}-macos-${{ matrix.label }}"
-          wails3 task darwin:create:dmg ARCH="${ARCH}" APP_BUNDLE_NAME="${APP_BUNDLE_NAME}" DMG_NAME="${DMG_NAME}" DMG_VOLUME_NAME="${APP_BUNDLE_NAME}"
+
+          wails3 task common:generate:icons common:build:frontend
+
+          if [[ "${ARCH}" == "amd64" ]]; then
+            CLANG_ARCH="x86_64"
+            MIN_MACOS="10.15"
+          else
+            CLANG_ARCH="arm64"
+            MIN_MACOS="11.0"
+          fi
+
+          GOOS=darwin \
+          CGO_ENABLED=1 \
+          GOARCH="${ARCH}" \
+          CGO_CFLAGS="-arch ${CLANG_ARCH} -mmacosx-version-min=${MIN_MACOS}" \
+          CGO_LDFLAGS="-arch ${CLANG_ARCH} -mmacosx-version-min=${MIN_MACOS}" \
+          MACOSX_DEPLOYMENT_TARGET="${MIN_MACOS}" \
+          go build -tags production -trimpath -buildvcs=false -ldflags="-w -s" -o "bin/${APP_NAME}" ./cmd/proxyseparator
+
+          APP_BUNDLE_PATH="bin/${APP_BUNDLE_NAME}.app"
+          rm -rf "${APP_BUNDLE_PATH}" "bin/.dmg-root" "bin/${DMG_NAME}.dmg"
+          mkdir -p "${APP_BUNDLE_PATH}/Contents/MacOS" "${APP_BUNDLE_PATH}/Contents/Resources"
+          cp build/darwin/icons.icns "${APP_BUNDLE_PATH}/Contents/Resources"
+          cp "bin/${APP_NAME}" "${APP_BUNDLE_PATH}/Contents/MacOS/${APP_NAME}"
+          cp build/darwin/Info.plist "${APP_BUNDLE_PATH}/Contents/Info.plist"
+          codesign --force --deep --sign - "${APP_BUNDLE_PATH}"
+
           echo "Runner architecture: $(uname -m)"
-          BINARY_INFO="$(file -b "bin/${APP_BUNDLE_NAME}.app/Contents/MacOS/${APP_NAME}")"
+          BINARY_INFO="$(file -b "${APP_BUNDLE_PATH}/Contents/MacOS/${APP_NAME}")"
           echo "Binary info: ${BINARY_INFO}"
           if [[ "${BINARY_INFO}" != *"${{ matrix.macho_arch }}"* ]]; then
             echo "Expected macOS binary architecture '${{ matrix.macho_arch }}' but got '${BINARY_INFO}'."
             exit 1
           fi
+
+          mkdir -p bin/.dmg-root
+          cp -R "${APP_BUNDLE_PATH}" bin/.dmg-root/
+          hdiutil create -volname "${APP_BUNDLE_NAME}" -srcfolder bin/.dmg-root -ov -format UDZO "bin/${DMG_NAME}.dmg"
+          rm -rf bin/.dmg-root
+
           mkdir -p release-assets
           mv "bin/${DMG_NAME}.dmg" "release-assets/${DMG_NAME}.dmg"
 
@@ -156,32 +192,44 @@ jobs:
         shell: bash
         run: go test ./...
 
-      - name: Build installer
+      - name: Update build assets
+        shell: bash
+        run: wails3 task common:update:build-assets
+
+      - name: Build Windows binary
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ASSET_NAME="${APP_NAME}-${VERSION}-windows-${{ matrix.label }}-setup.exe"
+
+          wails3 task common:generate:icons common:build:frontend
+          wails3 task windows:generate:syso ARCH=${{ matrix.arch }}
+
+          GOOS=windows \
+          CGO_ENABLED=0 \
+          GOARCH=${{ matrix.arch }} \
+          go build -tags production -trimpath -buildvcs=false -ldflags="-w -s -H windowsgui" -o "bin/${APP_NAME}.exe" ./cmd/proxyseparator
+
+          rm -f ./*.syso
+          mkdir -p release-assets
+
+      - name: Package installer
         shell: pwsh
         run: |
-          wails3 task windows:package ARCH=${{ matrix.arch }}
-          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
           $version = $env:GITHUB_REF_NAME -replace '^v', ''
           $assetName = "$env:APP_NAME-$version-windows-${{ matrix.label }}-setup.exe"
-          $exactInstallerPath = Join-Path "bin" "$env:APP_NAME-${{ matrix.arch }}-installer.exe"
+          $argFlag = if ('${{ matrix.arch }}' -eq 'amd64') { 'AMD64' } else { 'ARM64' }
+          $binaryPath = (Resolve-Path "bin/$env:APP_NAME.exe").Path
 
-          if (Test-Path -LiteralPath $exactInstallerPath) {
-            $installer = Get-Item -LiteralPath $exactInstallerPath
-          } else {
-            $candidates = @(Get-ChildItem -Path bin -Filter "$env:APP_NAME-*-installer.exe")
+          wails3 generate webview2bootstrapper -dir "$PWD\build\windows\nsis"
+          & makensis "-DARG_WAILS_${argFlag}_BINARY=$binaryPath" "build/windows/nsis/project.nsi"
 
-            if ($candidates.Count -ne 1) {
-              throw "Expected one installer for architecture ${{ matrix.arch }}, found $($candidates.Count)."
-            }
-
-            $installer = $candidates[0]
+          $installerPath = Join-Path $PWD "bin/$env:APP_NAME-${{ matrix.arch }}-installer.exe"
+          if (-not (Test-Path -LiteralPath $installerPath)) {
+            throw "Installer not found at $installerPath."
           }
 
-          if (-not $installer) {
-            throw "Installer not found under bin/ for architecture ${{ matrix.arch }}."
-          }
-
-          Move-Item -LiteralPath $installer.FullName -Destination (Join-Path "release-assets" $assetName)
+          Move-Item -LiteralPath $installerPath -Destination (Join-Path "release-assets" $assetName)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
