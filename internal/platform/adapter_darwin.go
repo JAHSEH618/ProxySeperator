@@ -55,6 +55,7 @@ type darwinController struct {
 	tun          *tunHelperProcess
 	tunInterface string
 	dnsSnapshot  map[string][]string
+	rhelper      routeHelper
 }
 
 func NewController(logger *logging.Logger) Controller {
@@ -197,16 +198,42 @@ func (c *darwinController) ApplyCompanyBypassRoutes(ctx context.Context, iface s
 	if iface == "" || len(routes) == 0 {
 		return nil
 	}
-	output, err := runPrivilegedScript(ctx, buildApplyCompanyBypassRoutesScript(iface, routes))
+	// If the route helper is already running, send commands through it.
+	if c.rhelper.running() {
+		return c.rhelper.addRoutes(iface, routes)
+	}
+	// First call: start a route helper that applies the initial routes AND
+	// stays alive to handle future dynamic route additions — one admin prompt.
+	output, err := runPrivilegedScript(ctx, buildRouteHelperScript(iface, routes))
 	if err != nil {
 		return wrapPrivilegedCommandError("安装公司旁路路由失败", err, output)
 	}
+	fifoPath, pid := parseRouteHelperOutput(string(output))
+	if fifoPath == "" {
+		// Helper didn't start (maybe older macOS); static routes were still applied.
+		return nil
+	}
+	fd, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+	if err != nil {
+		return nil // Helper FIFO not accessible; static routes were applied, dynamic won't work.
+	}
+	c.rhelper.mu.Lock()
+	c.rhelper.fifoPath = fifoPath
+	c.rhelper.pid = pid
+	c.rhelper.fifoFD = fd
+	c.rhelper.mu.Unlock()
 	return nil
 }
 
 func (c *darwinController) ClearCompanyBypassRoutes(ctx context.Context, iface string, routes []string) error {
 	if iface == "" || len(routes) == 0 {
 		return nil
+	}
+	// Use the route helper if it's running; otherwise fall back to osascript.
+	if c.rhelper.running() {
+		err := c.rhelper.removeRoutes(iface, routes)
+		c.rhelper.stop()
+		return err
 	}
 	output, err := runPrivilegedScript(ctx, buildClearCompanyBypassRoutesScript(iface, routes))
 	if err != nil {

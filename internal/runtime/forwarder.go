@@ -183,12 +183,12 @@ func (f *Forwarder) dialCompanyTarget(ctx context.Context, network, addr string)
 	preparer := f.companyDialer
 	f.mu.RUnlock()
 	if preparer != nil {
-		candidates, err := preparer.PrepareDialTargets(ctx, addr)
-		if err == nil && len(candidates) > 0 {
-			return dialSystemRouteCandidates(ctx, network, candidates)
+		conn, err := preparer.DialContext(ctx, network, addr)
+		if err == nil {
+			return conn, nil
 		}
-		if err != nil && f.logger != nil {
-			f.logger.Warn("runtime.forwarder", "公司域名动态直连准备失败，回退到系统解析", map[string]any{
+		if f.logger != nil {
+			f.logger.Warn("runtime.forwarder", "公司域名动态直连失败，回退到系统解析", map[string]any{
 				"target": addr,
 				"error":  err.Error(),
 			})

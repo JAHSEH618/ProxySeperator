@@ -22,7 +22,7 @@ var companyFakeIPPrefixes = []netip.Prefix{
 }
 
 type companyDialPreparer interface {
-	PrepareDialTargets(ctx context.Context, addr string) ([]string, error)
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 	Refresh(ctx context.Context)
 	DynamicRoutes() []string
 }
@@ -72,27 +72,34 @@ func newCompanyDomainDialer(
 	}
 }
 
-func (d *companyDomainDialer) PrepareDialTargets(ctx context.Context, addr string) ([]string, error) {
+// DialContext resolves the company domain to real IPs, ensures bypass routes
+// are installed, and dials the target through the system route.
+func (d *companyDomainDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := splitDialTarget(addr)
 	if err != nil {
 		return nil, err
 	}
+
+	// If already an IP address, dial directly.
 	if parsed, parseErr := netip.ParseAddr(host); parseErr == nil {
-		return []string{net.JoinHostPort(parsed.String(), port)}, nil
+		return dialSystemRouteCandidates(ctx, network, []string{net.JoinHostPort(parsed.String(), port)})
 	}
 
+	// Try cached DNS result first.
 	if targets, ok := d.cachedTargets(host, port, time.Now()); ok {
-		return targets, nil
+		return dialSystemRouteCandidates(ctx, network, targets)
 	}
 
+	// Resolve via company DNS.
 	answer, err := d.lookupDomain(ctx, host)
 	if err != nil {
+		// Fall back to stale cache.
 		if targets, ok := d.cachedTargets(host, port, time.Now().Add(30*time.Second)); ok {
 			d.logger.Warn("runtime.company_dns", "公司域名解析失败，回退到最近一次缓存结果", map[string]any{
 				"domain": host,
 				"error":  err.Error(),
 			})
-			return targets, nil
+			return dialSystemRouteCandidates(ctx, network, targets)
 		}
 		return nil, err
 	}
@@ -107,7 +114,7 @@ func (d *companyDomainDialer) PrepareDialTargets(ctx context.Context, addr strin
 	if err := d.updateDomain(ctx, host, answer.addresses, answer.ttl); err != nil {
 		return nil, err
 	}
-	return joinResolvedTargets(answer.addresses, port), nil
+	return dialSystemRouteCandidates(ctx, network, joinResolvedTargets(answer.addresses, port))
 }
 
 func (d *companyDomainDialer) Refresh(ctx context.Context) {

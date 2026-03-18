@@ -23,6 +23,7 @@ const (
 	defaultSOCKSProxyListen = "127.0.0.1:17901"
 	defaultDNSListen        = "127.0.0.1:18553"
 	defaultRecoveryJournal  = "recovery-journal.json"
+	privilegedPromptTimeout = 60 * time.Second
 )
 
 type Manager struct {
@@ -110,7 +111,7 @@ func (m *Manager) RunPreflight(cfg api.Config) (api.PreflightReport, error) {
 	defer m.mu.Unlock()
 
 	m.cfg = cfg
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 	defer cancel()
 
 	autoRecovered, err := m.tryAutoRecoverLocked(ctx, cfg)
@@ -136,7 +137,7 @@ func (m *Manager) EnsureRecovered(cfg api.Config) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 	defer cancel()
 
 	return m.tryAutoRecoverLocked(ctx, cfg)
@@ -150,7 +151,7 @@ func (m *Manager) RecoverNetwork() error {
 		return api.NewError(api.ErrCodeRuntimeAlreadyRunning, "运行时正在运行，无法执行网络恢复")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 	defer cancel()
 	_, err := m.recoverNetworkLocked(ctx, m.cfg)
 	if err != nil {
@@ -176,12 +177,12 @@ func (m *Manager) ForceRecoverNetwork() error {
 	if m.status.State == api.RuntimeStateRunning || m.status.State == api.RuntimeStateStarting {
 		m.status.State = api.RuntimeStateStopping
 		m.emitStatus()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 		m.rollbackLocked(stopCtx)
 		stopCancel()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 	defer cancel()
 
 	// Try journal-based recovery if journal still exists.
@@ -213,7 +214,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	}
 
 	m.cfg = cfg
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 	defer cancel()
 
 	if _, err := m.tryAutoRecoverLocked(ctx, cfg); err != nil {
@@ -458,7 +459,7 @@ func (m *Manager) Stop() error {
 	m.status.State = api.RuntimeStateStopping
 	m.emitStatus()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 	defer cancel()
 	m.rollbackLocked(ctx)
 	if !m.status.RecoveryRequired {
@@ -622,7 +623,7 @@ func (m *Manager) rollbackLocked(_ context.Context) {
 	recoveredFromJournal := false
 	var rollbackErr error
 	if m.journal.Exists() {
-		recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		recoverCtx, recoverCancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 		snapshot, err := m.journal.Load()
 		if err != nil {
 			rollbackErr = err
@@ -647,13 +648,13 @@ func (m *Manager) rollbackLocked(_ context.Context) {
 	}
 
 	if !recoveredFromJournal && m.status.Mode == api.ModeTUN {
-		tunCtx, tunCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		tunCtx, tunCancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 		if err := m.platform.StopTUN(tunCtx); err != nil {
 			m.logger.Warn("runtime", "停止 TUN 失败", map[string]any{"error": err.Error()})
 		}
 		tunCancel()
 	} else if !recoveredFromJournal {
-		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 		routes := append([]string(nil), m.companyBypassRoutes...)
 		if m.companyDomainDialer != nil {
 			routes = mergeRouteLists(routes, m.companyDomainDialer.DynamicRoutes())
@@ -788,7 +789,7 @@ func (m *Manager) handleDeadListeners() {
 	m.status.State = api.RuntimeStateStopping
 	m.emitStatus()
 
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), privilegedPromptTimeout)
 	defer stopCancel()
 	m.rollbackLocked(stopCtx)
 
@@ -862,3 +863,4 @@ func mergeRouteLists(routeSets ...[]string) []string {
 	sort.Strings(merged)
 	return merged
 }
+

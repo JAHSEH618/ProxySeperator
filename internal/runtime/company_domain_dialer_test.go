@@ -30,13 +30,11 @@ func TestCompanyDomainDialerUsesRealResolverAndRegistersHostRoute(t *testing.T) 
 		nil,
 	)
 
-	targets, err := dialer.PrepareDialTargets(context.Background(), "auth.4a.cmft:443")
-	if err != nil {
-		t.Fatalf("prepare dial targets failed: %v", err)
-	}
-	if len(targets) != 1 || targets[0] != "203.0.113.10:443" {
-		t.Fatalf("unexpected targets: %+v", targets)
-	}
+	// DialContext will fail to connect (no real server), but routes should be installed.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = dialer.DialContext(ctx, "tcp", "auth.4a.cmft:443")
+
 	if got, want := controller.bypassInterface, "utun4"; got != want {
 		t.Fatalf("expected bypass interface %q, got %q", want, got)
 	}
@@ -68,12 +66,12 @@ func TestCompanyDomainDialerSkipsFakeIPAnswers(t *testing.T) {
 		nil,
 	)
 
-	targets, err := dialer.PrepareDialTargets(context.Background(), "auth.4a.cmft:443")
-	if err != nil {
-		t.Fatalf("prepare dial targets failed: %v", err)
-	}
-	if len(targets) != 1 || targets[0] != "203.0.113.21:443" {
-		t.Fatalf("unexpected targets: %+v", targets)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = dialer.DialContext(ctx, "tcp", "auth.4a.cmft:443")
+
+	if len(controller.bypassRoutes) != 1 || controller.bypassRoutes[0] != "203.0.113.21/32" {
+		t.Fatalf("unexpected bypass routes: %+v", controller.bypassRoutes)
 	}
 }
 
@@ -101,9 +99,9 @@ func TestCompanyDomainDialerRefreshReplacesExpiredRoutes(t *testing.T) {
 	)
 	dialer.refreshLead = 0
 
-	if _, err := dialer.PrepareDialTargets(context.Background(), "auth.4a.cmft:443"); err != nil {
-		t.Fatalf("prepare dial targets failed: %v", err)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = dialer.DialContext(ctx, "tcp", "auth.4a.cmft:443")
 	time.Sleep(1100 * time.Millisecond)
 
 	mu.Lock()
