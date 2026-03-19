@@ -49,9 +49,10 @@ type Manager struct {
 	cfg    api.Config
 	cancel context.CancelFunc
 
-	companyBypassInterface string
-	companyBypassRoutes    []string
-	companyDomainDialer    *companyDomainDialer
+	companyBypassInterface    string
+	companyBypassRoutes       []string
+	companyDomainDialer       *companyDomainDialer
+	vpnHandlesCompanyTraffic  bool
 }
 
 type Options struct {
@@ -277,6 +278,7 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 	m.companyBypassInterface = ""
 	m.companyBypassRoutes = nil
 	m.companyDomainDialer = nil
+	m.vpnHandlesCompanyTraffic = false
 	m.emitStatus()
 
 	matcher := rules.NewMatcher(rules.ParseLines(m.cfg.Rules).Compiled)
@@ -363,61 +365,71 @@ func (m *Manager) Start(cfg api.Config) (api.RuntimeStatus, error) {
 		}
 	} else {
 		if m.cfg.Advanced.PersonalTUNMode {
-			bypassRoutes := companyBypassCIDRs(m.cfg)
-			if len(bypassRoutes) > 0 {
-				iface, err := m.platform.PreferredCompanyBypassInterface(runCtx)
-				if err != nil {
-					m.rollbackLocked(runCtx)
-					wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "无法识别公司旁路接口", err)
-					m.status.LastErrorCode = wrapped.Code
-					m.status.LastErrorMessage = wrapped.Error()
-					m.emitStatus()
-					return m.status, wrapped
-				}
-				if err := m.platform.ApplyCompanyBypassRoutes(runCtx, iface, bypassRoutes); err != nil {
-					m.rollbackLocked(runCtx)
-					m.status.LastErrorCode = api.ErrorCode(err)
-					m.status.LastErrorMessage = err.Error()
-					m.emitStatus()
-					return m.status, err
-				}
-				m.companyBypassInterface = iface
-				m.companyBypassRoutes = append([]string(nil), bypassRoutes...)
-				snapshot.CompanyBypass = api.CompanyBypassState{
-					Interface: iface,
-					Routes:    append([]string(nil), bypassRoutes...),
-				}
-				snapshot.WrittenAt = time.Now()
-				_ = m.journal.Save(snapshot)
+			// 检测默认路由是否已通过 VPN
+			isVPN, vpnIface, vpnErr := m.platform.IsDefaultRouteViaVPN(runCtx)
+			if vpnErr != nil {
+				m.logger.Warn("runtime", "检测 VPN 默认路由失败", map[string]any{"error": vpnErr.Error()})
 			}
-			resolvers := []string(nil)
-			if currentResolvers, err := m.platform.CurrentDNSResolvers(runCtx); err == nil {
-				resolvers = append(resolvers, currentResolvers...)
+			if isVPN {
+				m.logger.Info("runtime", "检测到默认路由已通过公司 VPN，跳过公司旁路路由", map[string]any{"vpnInterface": vpnIface})
+				m.vpnHandlesCompanyTraffic = true
 			} else {
-				m.logger.Warn("runtime", "读取当前 DNS 解析器失败，将仅使用本地回环解析器做公司域名解析", map[string]any{"error": err.Error()})
-			}
-			m.companyDomainDialer = newCompanyDomainDialer(
-				m.logger,
-				m.platform,
-				m.companyBypassInterface,
-				resolvers,
-				func(dynamicRoutes []string) {
-					if !m.journal.Exists() {
-						return
-					}
-					snapshot, err := m.journal.Load()
+				bypassRoutes := companyBypassCIDRs(m.cfg)
+				if len(bypassRoutes) > 0 {
+					iface, err := m.platform.PreferredCompanyBypassInterface(runCtx)
 					if err != nil {
-						return
+						m.rollbackLocked(runCtx)
+						wrapped := api.WrapError(api.ErrCodeSystemProxyFailed, "无法识别公司旁路接口", err)
+						m.status.LastErrorCode = wrapped.Code
+						m.status.LastErrorMessage = wrapped.Error()
+						m.emitStatus()
+						return m.status, wrapped
 					}
+					if err := m.platform.ApplyCompanyBypassRoutes(runCtx, iface, bypassRoutes); err != nil {
+						m.rollbackLocked(runCtx)
+						m.status.LastErrorCode = api.ErrorCode(err)
+						m.status.LastErrorMessage = err.Error()
+						m.emitStatus()
+						return m.status, err
+					}
+					m.companyBypassInterface = iface
+					m.companyBypassRoutes = append([]string(nil), bypassRoutes...)
 					snapshot.CompanyBypass = api.CompanyBypassState{
-						Interface: m.companyBypassInterface,
-						Routes:    mergeRouteLists(m.companyBypassRoutes, dynamicRoutes),
+						Interface: iface,
+						Routes:    append([]string(nil), bypassRoutes...),
 					}
 					snapshot.WrittenAt = time.Now()
 					_ = m.journal.Save(snapshot)
-				},
-			)
-			m.forwarder.SetCompanyDialPreparer(m.companyDomainDialer)
+				}
+				resolvers := []string(nil)
+				if currentResolvers, err := m.platform.CurrentDNSResolvers(runCtx); err == nil {
+					resolvers = append(resolvers, currentResolvers...)
+				} else {
+					m.logger.Warn("runtime", "读取当前 DNS 解析器失败，将仅使用本地回环解析器做公司域名解析", map[string]any{"error": err.Error()})
+				}
+				m.companyDomainDialer = newCompanyDomainDialer(
+					m.logger,
+					m.platform,
+					m.companyBypassInterface,
+					resolvers,
+					func(dynamicRoutes []string) {
+						if !m.journal.Exists() {
+							return
+						}
+						snapshot, err := m.journal.Load()
+						if err != nil {
+							return
+						}
+						snapshot.CompanyBypass = api.CompanyBypassState{
+							Interface: m.companyBypassInterface,
+							Routes:    mergeRouteLists(m.companyBypassRoutes, dynamicRoutes),
+						}
+						snapshot.WrittenAt = time.Now()
+						_ = m.journal.Save(snapshot)
+					},
+				)
+				m.forwarder.SetCompanyDialPreparer(m.companyDomainDialer)
+			}
 		}
 		if err := m.platform.ApplySystemProxy(runCtx, m.systemProxyConfig()); err != nil {
 			m.rollbackLocked(runCtx)
@@ -550,6 +562,7 @@ func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (boo
 		m.companyBypassInterface = ""
 		m.companyBypassRoutes = nil
 		m.companyDomainDialer = nil
+		m.vpnHandlesCompanyTraffic = false
 		m.emitStatus()
 		return false, nil
 	}
@@ -588,6 +601,7 @@ func (m *Manager) recoverNetworkLocked(ctx context.Context, cfg api.Config) (boo
 	m.companyBypassInterface = ""
 	m.companyBypassRoutes = nil
 	m.companyDomainDialer = nil
+	m.vpnHandlesCompanyTraffic = false
 	m.emitStatus()
 	return true, nil
 }
@@ -661,7 +675,10 @@ func (m *Manager) rollbackLocked(_ context.Context) {
 		}
 		if m.companyBypassInterface != "" && len(routes) > 0 {
 			if err := m.platform.ClearCompanyBypassRoutes(cleanCtx, m.companyBypassInterface, routes); err != nil {
-				m.logger.Warn("runtime", "清理公司旁路路由失败", map[string]any{"error": err.Error()})
+				m.logger.Warn("runtime", "清理公司旁路路由失败，尝试强制终止路由助手", map[string]any{"error": err.Error()})
+				// Fallback: force-stop the route helper to kill the privileged
+				// process, which ensures no lingering routes via orphaned daemon.
+				m.platform.StopRouteHelper()
 			}
 		}
 		if err := m.platform.ClearSystemProxy(cleanCtx); err != nil {
@@ -669,6 +686,10 @@ func (m *Manager) rollbackLocked(_ context.Context) {
 		}
 		cleanCancel()
 	}
+
+	// Always stop the route helper on all exit paths — including after
+	// successful journal recovery — to ensure no orphaned helper process.
+	m.platform.StopRouteHelper()
 
 	m.dns = nil
 	m.dnsCache.Clear()
@@ -690,6 +711,7 @@ func (m *Manager) rollbackLocked(_ context.Context) {
 	m.companyBypassInterface = ""
 	m.companyBypassRoutes = nil
 	m.companyDomainDialer = nil
+	m.vpnHandlesCompanyTraffic = false
 	m.emitStatus()
 }
 

@@ -65,6 +65,10 @@ func (u *unsupportedController) DefaultEgressInterface(context.Context) (string,
 	return "", api.NewError(api.ErrCodePlatformUnsupported, "当前平台不支持默认出口检测")
 }
 
+func (u *unsupportedController) IsDefaultRouteViaVPN(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+
 func (u *unsupportedController) ValidateTUN(context.Context) error {
 	return api.NewError(api.ErrCodeTUNUnavailable, "当前平台不支持 TUN")
 }
@@ -76,3 +80,5 @@ func (u *unsupportedController) StartTUN(context.Context, TUNOptions) error {
 func (u *unsupportedController) StopTUN(context.Context) error {
 	return nil
 }
+
+func (u *unsupportedController) StopRouteHelper() {}

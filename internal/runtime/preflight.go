@@ -156,10 +156,16 @@ func (m *Manager) evaluatePreflight(ctx context.Context, cfg api.Config) preflig
 	tunRequired := !personalTUNMode && (report.RequestedMode == api.ModeTUN || proxyConflict)
 	checks = append(checks, passCheck(checkCompanyUpstream, "公司流量将复用系统路由和现有公司 VPN"))
 	if personalTUNMode {
-		if len(companyBypassRoutes) == 0 {
+		isVPN, vpnIface, vpnErr := m.platform.IsDefaultRouteViaVPN(ctx)
+		if vpnErr != nil {
+			m.logger.Warn("runtime", "预检：检测 VPN 默认路由失败", map[string]any{"error": vpnErr.Error()})
+		}
+		if isVPN {
+			checks = append(checks, passCheck(checkCompanyBypassRoutes, fmt.Sprintf("默认路由已通过公司 VPN (%s)，跳过旁路路由", vpnIface)))
+		} else if len(companyBypassRoutes) == 0 {
 			checks = append(checks, failCheck(checkCompanyBypassRoutes, api.ErrCodeInvalidConfig, "个人代理长期 TUN 已开启，但未配置公司 CIDR 旁路规则"))
 		} else {
-			checks = append(checks, passCheck(checkCompanyBypassRoutes, "已配置公司 CIDR 旁路规则"))
+			checks = append(checks, passCheck(checkCompanyBypassRoutes, "将通过特权路由助手为公司 CIDR 添加旁路路由（首次需要管理员授权）"))
 		}
 	}
 

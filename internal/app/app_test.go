@@ -63,6 +63,10 @@ func (f *fakePlatformController) StartTUN(context.Context, platform.TUNOptions) 
 	return nil
 }
 func (f *fakePlatformController) StopTUN(context.Context) error { return nil }
+func (f *fakePlatformController) StopRouteHelper()              {}
+func (f *fakePlatformController) IsDefaultRouteViaVPN(context.Context) (bool, string, error) {
+	return false, "", nil
+}
 
 func TestOnShutdownStopsRunningRuntime(t *testing.T) {
 	logger := logging.NewLogger(logging.NewRingBuffer(50))

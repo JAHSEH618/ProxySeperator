@@ -202,20 +202,51 @@ func (c *darwinController) ApplyCompanyBypassRoutes(ctx context.Context, iface s
 	if c.rhelper.running() {
 		return c.rhelper.addRoutes(iface, routes)
 	}
+
+	// Clean up any orphaned helpers/FIFOs from previous crashed sessions.
+	cleanupOrphanedFiles()
+
 	// First call: start a route helper that applies the initial routes AND
 	// stays alive to handle future dynamic route additions — one admin prompt.
+	c.logger.Info("platform.darwin", "启动路由助手守护进程", map[string]any{
+		"interface":  iface,
+		"routeCount": len(routes),
+	})
 	output, err := runPrivilegedScript(ctx, buildRouteHelperScript(iface, routes))
 	if err != nil {
 		return wrapPrivilegedCommandError("安装公司旁路路由失败", err, output)
 	}
-	fifoPath, pid := parseRouteHelperOutput(string(output))
-	if fifoPath == "" {
-		// Helper didn't start (maybe older macOS); static routes were still applied.
+	fifoPath, pid, parseErr := parseRouteHelperOutput(string(output))
+	if parseErr != nil {
+		c.logger.Warn("platform.darwin", "路由助手输出解析失败", map[string]any{
+			"error":  parseErr.Error(),
+			"output": strings.TrimSpace(string(output)),
+		})
+		// Attempt to kill the helper if we got a PID but failed overall.
+		killHelperByPID(pid)
+		if fifoPath != "" {
+			_ = os.Remove(fifoPath)
+		}
+		c.logger.Warn("platform.darwin", "路由助手未启动（解析失败），动态路由将需要单独授权", nil)
 		return nil
 	}
+
+	c.logger.Info("platform.darwin", "路由助手已启动", map[string]any{
+		"fifo": fifoPath,
+		"pid":  pid,
+	})
+
 	fd, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
 	if err != nil {
-		return nil // Helper FIFO not accessible; static routes were applied, dynamic won't work.
+		c.logger.Warn("platform.darwin", "无法连接路由助手 FIFO，正在清理", map[string]any{
+			"error": err.Error(),
+			"fifo":  fifoPath,
+			"pid":   pid,
+		})
+		killHelperByPID(pid)
+		_ = os.Remove(fifoPath)
+		c.logger.Warn("platform.darwin", "路由助手 FIFO 连接失败，动态路由将需要单独授权", nil)
+		return nil
 	}
 	c.rhelper.mu.Lock()
 	c.rhelper.fifoPath = fifoPath
@@ -229,17 +260,20 @@ func (c *darwinController) ClearCompanyBypassRoutes(ctx context.Context, iface s
 	if iface == "" || len(routes) == 0 {
 		return nil
 	}
-	// Use the route helper if it's running; otherwise fall back to osascript.
+	// Use the route helper if it's running; do NOT stop it — the helper stays
+	// alive for the entire session so future calls avoid another admin prompt.
 	if c.rhelper.running() {
-		err := c.rhelper.removeRoutes(iface, routes)
-		c.rhelper.stop()
-		return err
+		return c.rhelper.removeRoutes(iface, routes)
 	}
 	output, err := runPrivilegedScript(ctx, buildClearCompanyBypassRoutesScript(iface, routes))
 	if err != nil {
 		return wrapPrivilegedCommandError("清理公司旁路路由失败", err, output)
 	}
 	return nil
+}
+
+func (c *darwinController) StopRouteHelper() {
+	c.rhelper.stop()
 }
 
 func (c *darwinController) EnableAutoStart(ctx context.Context, executablePath string) error {
@@ -450,11 +484,29 @@ func (c *darwinController) RecoverNetwork(ctx context.Context, snapshot api.Reco
 		}
 	}
 	if snapshot.CompanyBypass.Interface != "" && len(snapshot.CompanyBypass.Routes) > 0 {
-		output, err := runPrivilegedScript(ctx, buildClearCompanyBypassRoutesScript(snapshot.CompanyBypass.Interface, snapshot.CompanyBypass.Routes))
-		if err != nil {
-			return api.WrapError(api.ErrCodeRecoveryFailed,
-				"恢复公司旁路路由失败",
-				wrapCommandError(err, output))
+		if c.rhelper.running() {
+			if err := c.rhelper.removeRoutes(snapshot.CompanyBypass.Interface, snapshot.CompanyBypass.Routes); err != nil {
+				c.logger.Warn("platform.darwin", "通过路由助手清理公司旁路路由失败，回退到特权脚本", map[string]any{"error": err.Error()})
+				output, err := runPrivilegedScript(ctx, buildClearCompanyBypassRoutesScript(snapshot.CompanyBypass.Interface, snapshot.CompanyBypass.Routes))
+				if err != nil {
+					// Log but do not return error — route deletion failures are
+					// expected when routes were already removed or never existed.
+					c.logger.Warn("platform.darwin", "特权脚本清理公司旁路路由失败（路由可能已不存在）", map[string]any{
+						"error":  err.Error(),
+						"output": strings.TrimSpace(string(output)),
+					})
+				}
+			}
+		} else {
+			output, err := runPrivilegedScript(ctx, buildClearCompanyBypassRoutesScript(snapshot.CompanyBypass.Interface, snapshot.CompanyBypass.Routes))
+			if err != nil {
+				// Log but do not return error — route deletion failures are
+				// expected when routes were already removed or never existed.
+				c.logger.Warn("platform.darwin", "特权脚本清理公司旁路路由失败（路由可能已不存在）", map[string]any{
+					"error":  err.Error(),
+					"output": strings.TrimSpace(string(output)),
+				})
+			}
 		}
 	}
 
@@ -476,6 +528,17 @@ func (c *darwinController) DefaultEgressInterface(ctx context.Context) (string, 
 		return "", api.NewError(api.ErrCodeTUNUnavailable, "未识别默认出口接口")
 	}
 	return strings.TrimSpace(matches[1]), nil
+}
+
+func (c *darwinController) IsDefaultRouteViaVPN(ctx context.Context) (bool, string, error) {
+	iface, err := c.DefaultEgressInterface(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	if strings.HasPrefix(iface, "utun") {
+		return true, iface, nil
+	}
+	return false, iface, nil
 }
 
 func (c *darwinController) ValidateTUN(ctx context.Context) error {

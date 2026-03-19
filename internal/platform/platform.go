@@ -30,7 +30,11 @@ type Controller interface {
 	CaptureRecoverySnapshot(ctx context.Context, mode string) (api.RecoverySnapshot, error)
 	RecoverNetwork(ctx context.Context, snapshot api.RecoverySnapshot) error
 	DefaultEgressInterface(ctx context.Context) (string, error)
+	// IsDefaultRouteViaVPN 检测默认路由是否通过 VPN 接口（utun*）
+	// 返回: isVPN, vpnInterface, error
+	IsDefaultRouteViaVPN(ctx context.Context) (bool, string, error)
 	ValidateTUN(ctx context.Context) error
 	StartTUN(ctx context.Context, opts TUNOptions) error
 	StopTUN(ctx context.Context) error
+	StopRouteHelper()
 }

@@ -28,6 +28,8 @@ type fakePlatform struct {
 	recoverCalled        bool
 	recoverErr           error
 	capturedSnapshots    []api.RecoverySnapshot
+	isDefaultRouteVPN    bool
+	vpnInterface         string
 }
 
 func (f *fakePlatform) ApplySystemProxy(context.Context, platform.SystemProxyConfig) error {
@@ -91,6 +93,9 @@ func (f *fakePlatform) DefaultEgressInterface(context.Context) (string, error) {
 	}
 	return f.defaultEgress, nil
 }
+func (f *fakePlatform) IsDefaultRouteViaVPN(context.Context) (bool, string, error) {
+	return f.isDefaultRouteVPN, f.vpnInterface, nil
+}
 func (f *fakePlatform) ValidateTUN(context.Context) error {
 	return f.validateTUNErr
 }
@@ -99,6 +104,7 @@ func (f *fakePlatform) StopTUN(context.Context) error {
 	f.stopTUNCalled = true
 	return nil
 }
+func (f *fakePlatform) StopRouteHelper() {}
 
 func TestManagerStartStopSystemMode(t *testing.T) {
 	companyStub := startSOCKS5Stub(t)

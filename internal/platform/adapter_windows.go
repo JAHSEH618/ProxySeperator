@@ -281,6 +281,10 @@ func (c *windowsController) DefaultEgressInterface(ctx context.Context) (string,
 	return strings.TrimSpace(string(output)), nil
 }
 
+func (c *windowsController) IsDefaultRouteViaVPN(context.Context) (bool, string, error) {
+	return false, "", nil
+}
+
 func (c *windowsController) ValidateTUN(ctx context.Context) error {
 	if _, err := c.resolveWintunDirectory(); err != nil {
 		return err
@@ -385,6 +389,8 @@ func (c *windowsController) StopTUN(ctx context.Context) error {
 	}
 	return firstErr
 }
+
+func (c *windowsController) StopRouteHelper() {}
 
 func (c *windowsController) readSystemProxySnapshot() (windowsSystemProxySnapshot, error) {
 	key, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsPath, registry.QUERY_VALUE)
